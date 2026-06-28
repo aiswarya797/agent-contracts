@@ -1,0 +1,15 @@
+.DS_Store
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+.agent-contracts/cache/
+.agent-contracts/context-packs/
+.agent-contracts/drift-report.json
+.agent-contracts/refresh-plan.json
+.agent-contracts/init-plan.json
+
+docs/agent-contracts-plugin-prd.md
+docs/agent-contracts-plugin-lld.md

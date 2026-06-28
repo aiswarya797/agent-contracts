@@ -1,0 +1,6 @@
+{
+  "name": "@example/shared-api",
+  "scripts": {
+    "test": "node --test"
+  }
+}

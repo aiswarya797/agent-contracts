@@ -1,0 +1,17 @@
+{
+  "name": "agent-contracts",
+  "version": "0.1.0",
+  "description": "Local module contracts, agent instructions, context packs, and drift checks for enterprise repositories",
+  "author": {
+    "name": "Agent Contracts Maintainers"
+  },
+  "license": "MIT",
+  "keywords": [
+    "agents",
+    "architecture",
+    "contracts",
+    "local-first",
+    "modules",
+    "repository-analysis"
+  ]
+}

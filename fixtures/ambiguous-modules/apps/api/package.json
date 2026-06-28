@@ -1,0 +1,6 @@
+{
+  "name": "@example/web-api",
+  "scripts": {
+    "test": "node --test"
+  }
+}

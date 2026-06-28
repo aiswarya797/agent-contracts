@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "agent_contracts.py"
+
+
+def run_cli(*args: str, repo: Path | None = None) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, str(SCRIPT), *args]
+    if repo is not None:
+        command.extend(["--repo", str(repo)])
+    return subprocess.run(command, cwd=ROOT, text=True, capture_output=True, check=False)
+
+
+class AgentContractsTests(unittest.TestCase):
+    def test_doctor_reports_plugin_ready(self) -> None:
+        result = run_cli("doctor", "--format", "json", repo=ROOT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["summary"]["blockers"], 0)
+        self.assertTrue(data["local_only"])
+
+    def test_map_detects_python_modules(self) -> None:
+        result = run_cli("map", "--format", "json", repo=ROOT / "fixtures" / "python-service")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        modules = {module["name"]: module for module in data["modules"]}
+        names = set(modules)
+        self.assertIn("billing", names)
+        self.assertIn("auth", names)
+        self.assertIn("tests/test_billing.py", modules["billing"]["test_files"])
+
+    def test_map_detects_mixed_monorepo_dependency(self) -> None:
+        result = run_cli("map", "--format", "json", repo=ROOT / "fixtures" / "mixed-monorepo")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        modules = {module["name"]: module for module in json.loads(result.stdout)["modules"]}
+        self.assertIn("shared", modules["web"]["dependencies"])
+        self.assertIn("tests/web.test.ts", modules["web"]["test_files"])
+
+    def test_map_deduplicates_ambiguous_module_names(self) -> None:
+        result = run_cli("map", "--format", "json", repo=ROOT / "fixtures" / "ambiguous-modules")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        modules = json.loads(result.stdout)["modules"]
+        names = [module["name"] for module in modules]
+        roots = {module["root"] for module in modules}
+        self.assertEqual(len(names), len(set(names)))
+        self.assertIn("apps/api", roots)
+        self.assertIn("packages/api", roots)
+
+    def test_check_reports_broken_fixture_drift(self) -> None:
+        result = run_cli("check", "--format", "json", repo=ROOT / "fixtures" / "broken-drift")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        codes = {finding["code"] for finding in json.loads(result.stdout)["findings"]}
+        self.assertIn("internal-import", codes)
+        self.assertIn("undeclared-dependency", codes)
+        self.assertIn("undeclared-public-surface", codes)
+
+    def test_init_writes_new_contract_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "repo"
+            shutil.copytree(ROOT / "fixtures" / "python-service", target)
+            result = run_cli("init", "--write", "--yes", repo=target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((target / "ARCHITECTURE.md").exists())
+            self.assertTrue((target / "AGENTS.md").exists())
+            self.assertTrue((target / "src" / "billing" / "SPEC.md").exists())
+            self.assertTrue((target / ".agent-contracts" / "module-map.json").exists())
+
+    def test_init_preserves_existing_docs_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "repo"
+            shutil.copytree(ROOT / "fixtures" / "existing-docs", target)
+            original_agents = (target / "AGENTS.md").read_text(encoding="utf-8")
+            original_architecture = (target / "ARCHITECTURE.md").read_text(encoding="utf-8")
+
+            result = run_cli("init", "--write", "--yes", repo=target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            self.assertEqual((target / "AGENTS.md").read_text(encoding="utf-8"), original_agents)
+            self.assertEqual((target / "ARCHITECTURE.md").read_text(encoding="utf-8"), original_architecture)
+            self.assertTrue((target / "src" / "catalog" / "SPEC.md").exists())
+            self.assertTrue((target / "src" / "catalog" / "AGENTS.md").exists())
+
+    def test_init_overwrites_existing_docs_only_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "repo"
+            shutil.copytree(ROOT / "fixtures" / "existing-docs", target)
+
+            result = run_cli("init", "--write", "--yes", "--overwrite-existing", repo=target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            self.assertIn("Generated by agent-contracts", (target / "AGENTS.md").read_text(encoding="utf-8"))
+            self.assertIn("Generated by agent-contracts", (target / "ARCHITECTURE.md").read_text(encoding="utf-8"))
+
+    def test_context_pack_writes_bounded_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "repo"
+            shutil.copytree(ROOT / "fixtures" / "python-service", target)
+            init_result = run_cli("init", "--write", "--yes", repo=target)
+            self.assertEqual(init_result.returncode, 0, init_result.stderr)
+            output = Path(tmp) / "pack"
+            result = run_cli("context-pack", "billing", "--output", str(output), repo=target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((output / "README.md").exists())
+            manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["module"]["name"], "billing")
+            self.assertIn("src/billing/api.py", manifest["included_files"])
+
+
+if __name__ == "__main__":
+    unittest.main()
