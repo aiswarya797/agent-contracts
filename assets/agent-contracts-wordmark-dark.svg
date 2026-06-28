@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="150" viewBox="0 0 760 150" role="img" aria-labelledby="title desc">
+  <title id="title">agent-contracts</title>
+  <desc id="desc">Agent Contracts wordmark for dark backgrounds</desc>
+  <rect width="760" height="150" fill="none"/>
+  <g transform="translate(60 26)">
+    <path d="M6 72 C50 28, 96 28, 140 72 C184 116, 230 116, 274 72" fill="none" stroke="#F9FAFB" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="6" cy="72" r="4" fill="#F9FAFB"/>
+    <circle cx="140" cy="72" r="4" fill="#F9FAFB"/>
+    <circle cx="274" cy="72" r="4" fill="#F9FAFB"/>
+    <text x="320" y="78" fill="#F9FAFB" font-family="Georgia, 'Times New Roman', serif" font-size="58" font-weight="500">agent contracts</text>
+    <path d="M320 96 H682" stroke="#9CA3AF" stroke-width="1.5" stroke-linecap="round"/>
+  </g>
+</svg>

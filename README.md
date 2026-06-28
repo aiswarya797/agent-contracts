@@ -1,4 +1,19 @@
-# agent-contracts
+<p align="center">
+  <picture>
+    <source srcset="assets/agent-contracts-wordmark-dark.svg" media="(prefers-color-scheme: dark)">
+    <source srcset="assets/agent-contracts-wordmark-light.svg" media="(prefers-color-scheme: light)">
+    <img src="assets/agent-contracts-wordmark-light.svg" alt="agent-contracts">
+  </picture>
+</p>
+
+<p align="center">Local module contracts for AI coding agents.</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> |
+  <a href="#commands">Commands</a> |
+  <a href="#current-capabilities">Capabilities</a> |
+  <a href="#safety-model">Safety</a>
+</p>
 
 `agent-contracts` is a local Claude Code plugin for creating and maintaining module-level contracts for AI coding agents.
 
