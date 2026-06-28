@@ -1,0 +1,51 @@
+{
+  "name": "agent-contracts-cli",
+  "version": "0.1.0",
+  "description": "Local contracts that keep AI coding agents inside the shape of your repo.",
+  "license": "MIT",
+  "author": "Agent Contracts Maintainers",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aiswarya797/agent-contracts.git"
+  },
+  "homepage": "https://github.com/aiswarya797/agent-contracts#readme",
+  "bugs": {
+    "url": "https://github.com/aiswarya797/agent-contracts/issues"
+  },
+  "bin": {
+    "agent-contracts": "bin/agent-contracts.js"
+  },
+  "files": [
+    ".claude-plugin",
+    "assets",
+    "bin",
+    "commands",
+    "examples",
+    "scripts/agent_contracts.py",
+    "skills",
+    "CHANGELOG.md",
+    "LICENSE",
+    "PRIVACY.md",
+    "README.md",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "validate": "python3 scripts/validate_plugin.py",
+    "test": "python3 scripts/validate_plugin.py && python3 -m unittest discover -s tests",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "keywords": [
+    "ai-agents",
+    "claude-code",
+    "codex",
+    "contracts",
+    "developer-tools",
+    "repo-analysis"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

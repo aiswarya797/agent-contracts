@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -14,7 +15,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 REQUIRED_FILES = [
     ".claude-plugin/plugin.json",
+    ".npmignore",
     "README.md",
+    "package.json",
+    "bin/agent-contracts.js",
+    "assets/agent-contracts-wordmark-dark.svg",
+    "assets/agent-contracts-wordmark-light.svg",
     "commands/contract-init.md",
     "commands/contract-map.md",
     "commands/contract-check.md",
@@ -74,6 +80,20 @@ def validate_manifest() -> None:
     require("description" in manifest, "Plugin manifest needs a description")
 
 
+def validate_package() -> None:
+    package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+    require(package.get("name") == "agent-contracts-cli", "npm package name must be agent-contracts-cli")
+    require(package.get("bin", {}).get("agent-contracts") == "bin/agent-contracts.js", "package bin must expose agent-contracts")
+    require(package.get("publishConfig", {}).get("access") == "public", "package must publish publicly")
+    for path in [".claude-plugin", "commands", "skills", "scripts/agent_contracts.py", "bin", "assets"]:
+        require(path in package.get("files", []), f"package files should include {path}")
+
+    if shutil.which("node"):
+        result = run(["node", "bin/agent-contracts.js", "--help"])
+        require(result.returncode == 0, result.stderr)
+        require("context-pack" in result.stdout, "bin help should proxy analyzer help")
+
+
 def frontmatter(path: Path) -> dict[str, str]:
     text = path.read_text(encoding="utf-8")
     require(text.startswith("---\n"), f"{path} needs frontmatter")
@@ -108,10 +128,14 @@ def validate_markdown_entries() -> None:
 
 def validate_readme() -> None:
     text = (ROOT / "README.md").read_text(encoding="utf-8")
-    for command in sorted(EXPECTED_WORKFLOWS):
-        require(f"/{command}" in text, f"README should document /{command}")
-    for phrase in ["Quick Start", "Current Capabilities", "Current Limitations", "Safety Model", "Validation"]:
+    for command in sorted(EXPECTED_CLI_COMMANDS):
+        require(f"agent-contracts {command}" in text or command == "doctor", f"README should document agent-contracts {command}")
+    require("agent-contracts doctor" in text, "README should document agent-contracts doctor")
+    for phrase in ["Why This Is Needed", "What It Generates", "How To Install", "Commands"]:
         require(phrase in text, f"README should include {phrase}")
+    require("Repository Layout" not in text, "README should not expose repository layout as a main section")
+    require("Fixture Walkthrough" not in text, "README should not include fixture walkthrough")
+    require("module-level" not in text.lower(), "README should avoid module-level phrasing")
 
 
 def validate_gitignore() -> None:
@@ -175,6 +199,7 @@ def validate_cli() -> None:
 def main() -> int:
     validate_required_files()
     validate_manifest()
+    validate_package()
     validate_markdown_entries()
     validate_readme()
     validate_gitignore()

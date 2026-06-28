@@ -2,262 +2,165 @@
   <picture>
     <source srcset="assets/agent-contracts-wordmark-dark.svg" media="(prefers-color-scheme: dark)">
     <source srcset="assets/agent-contracts-wordmark-light.svg" media="(prefers-color-scheme: light)">
-    <img src="assets/agent-contracts-wordmark-light.svg" alt="agent-contracts">
+    <img src="assets/agent-contracts-wordmark-light.svg" alt="agent-contracts" width="420">
   </picture>
 </p>
 
-<p align="center">Local module contracts for AI coding agents.</p>
+<p align="center">Local contracts that keep AI coding agents inside the shape of your repo.</p>
 
 <p align="center">
-  <a href="#quick-start">Quick Start</a> |
-  <a href="#commands">Commands</a> |
-  <a href="#current-capabilities">Capabilities</a> |
-  <a href="#safety-model">Safety</a>
+  <a href="#why-this-is-needed">Why</a> |
+  <a href="#what-it-generates">Output</a> |
+  <a href="#how-to-install">Install</a> |
+  <a href="#commands">Commands</a>
 </p>
 
-`agent-contracts` is a local Claude Code plugin for creating and maintaining module-level contracts for AI coding agents.
+`agent-contracts` turns the implicit rules of a codebase into local, reviewable files that both humans and AI coding agents can read before making changes.
 
-It helps a repository answer five practical questions before an agent edits code:
+Most repos already contain the truth, but it is scattered across source files, tests, package manifests, docs, conventions, and team memory. This tool scans that evidence and writes contracts that answer:
 
-- Which logical module owns these files?
-- What public behavior does the module promise?
-- Which dependencies are expected or suspicious?
-- Which tests or commands verify the module?
-- Which local instructions should an agent read before working here?
+- Which part of the repo owns these files?
+- What public behavior is promised here?
+- Which dependencies are expected, and which ones look suspicious?
+- Which tests or commands prove the change still works?
+- Which local instructions should an agent read before touching code?
 
-The plugin is local-first. It reads repository files on your machine, writes Markdown and JSON artifacts only after approval, and does not require a cloud service, external API key, dependency installation, CI setup, or source upload.
+It is local-first: no source upload, no hosted service, no dependency install inside the target repo, and no target-code execution during analysis.
+
+## Why This Is Needed
+
+AI agents are fast at patching symptoms. That is useful until the patch crosses a hidden boundary.
+
+An agent can fix one failing test by importing a private helper, changing a public return shape, or editing a neighboring package it does not really own. The immediate task passes, but a different flow regresses later because the agent did not know the module contract, dependency rules, or verification path.
+
+`agent-contracts` makes those expectations explicit before the next change:
+
+- ownership boundaries are written down
+- public behavior is listed in one place
+- dependencies are compared against code evidence
+- test evidence is attached to the contract
+- agent instructions live next to the code they govern
+
+The goal is not more documentation. The goal is fewer patch fixes that quietly damage the repo.
 
 ## What It Generates
 
-When initialized in a target repository, the plugin can create:
+When initialized in a target repository, `agent-contracts` can create:
 
-- `ARCHITECTURE.md`: repository-wide module boundaries and invariants.
-- root `AGENTS.md`: repo-wide operating instructions for coding agents.
-- module `SPEC.md`: durable ownership, dependency, public-surface, and verification contract.
-- module `AGENTS.md`: local instructions for safe agent work inside the module.
-- `.agent-contracts/module-map.json`: machine-readable module graph.
-- `.agent-contracts/context-packs/...`: local, bounded bundles for scoped agent sessions.
+- `ARCHITECTURE.md`: repo-wide boundaries and invariants.
+- root `AGENTS.md`: repo-wide operating instructions for AI agents.
+- local `SPEC.md`: ownership, public behavior, dependencies, acceptance criteria, and verification evidence.
+- local `AGENTS.md`: instructions for safe agent work in that part of the repo.
+- `.agent-contracts/module-map.json`: machine-readable ownership and dependency map.
+- `.agent-contracts/context-packs/...`: bounded local bundles for focused agent sessions.
 
-Transient context packs and cache files should stay local. The durable contracts and module map are intended to be reviewed and committed when your team is happy with them.
+Generated files are plain Markdown and JSON. They are meant to be reviewed, edited, and committed like normal repo files.
 
-## Repository Layout
+## How To Install
 
-This plugin repo contains:
-
-- `.claude-plugin/plugin.json`: plugin metadata.
-- `commands/`: Claude slash-command wrappers.
-- `skills/`: Claude skills used by the command wrappers.
-- `scripts/agent_contracts.py`: the local analyzer and generator.
-- `fixtures/`: small repositories used for validation.
-- `tests/`: unit tests for analyzer behavior.
-- `examples/`: generated output examples.
-
-## Install
-
-Use this repository as a local Claude Code plugin. The metadata lives in `.claude-plugin/plugin.json`; command wrappers live in `commands/`; skill instructions live in `skills/`.
-
-You can also run the analyzer directly without Claude:
+Install today from GitHub through npm:
 
 ```bash
-python3 scripts/agent_contracts.py doctor --repo /path/to/repo
-python3 scripts/agent_contracts.py map --repo /path/to/repo
+npm install -g github:aiswarya797/agent-contracts
 ```
 
-Python 3.10+ is required. The analyzer uses the Python standard library only.
-
-## Quick Start
-
-From the repository you want to analyze:
+Then run it inside any repository:
 
 ```bash
-# 1. Check local readiness.
-python3 /path/to/agent-contracts/scripts/agent_contracts.py doctor --repo .
-
-# 2. Preview detected modules. This writes nothing.
-python3 /path/to/agent-contracts/scripts/agent_contracts.py map --repo .
-
-# 3. Preview generated contract files. This writes nothing.
-python3 /path/to/agent-contracts/scripts/agent_contracts.py init --repo .
-
-# 4. After reviewing the plan, write only new files.
-python3 /path/to/agent-contracts/scripts/agent_contracts.py init --repo . --write --yes
-
-# 5. Check for contract drift later.
-python3 /path/to/agent-contracts/scripts/agent_contracts.py check --repo .
+agent-contracts init --repo .
 ```
 
-Existing files are skipped unless you explicitly pass `--overwrite-existing`.
+The npm registry package is ready to publish as `agent-contracts-cli` because `agent-contracts` is already taken on npm. After registry publish, install with:
+
+```bash
+npm install -g agent-contracts-cli
+```
+
+The installed command is still:
+
+```bash
+agent-contracts --help
+```
+
+Python 3.10+ is required. The npm package is a thin launcher around the bundled local Python analyzer.
 
 ## Commands
 
-### `/contract-doctor`
+### 1. Initialize Contracts
 
-Checks whether the local plugin and target repository are ready.
-
-Direct script:
+Preview what would be generated:
 
 ```bash
-python3 scripts/agent_contracts.py doctor --repo .
+agent-contracts init --repo .
 ```
 
-It reports:
-
-- Python version support.
-- Plugin file layout.
-- Git availability and repository status.
-- Read/write permissions.
-- Ignore-rule warnings for transient outputs.
-- A read-only inventory sample.
-
-Exit codes:
-
-- `0`: usable.
-- `1`: usable with warnings.
-- `2`: blocked.
-
-### `/contract-map`
-
-Read-only module discovery.
-
-Direct script:
+Write only new files after review:
 
 ```bash
-python3 scripts/agent_contracts.py map --repo .
-python3 scripts/agent_contracts.py map --repo . --format json
+agent-contracts init --repo . --write --yes
 ```
 
-It detects logical modules, owned files, public surfaces, dependencies, tests, local commands, confidence, and boundary notes.
-
-### `/contract-init`
-
-Bootstraps contract files after a preview.
-
-Direct script:
+Overwrite existing generated paths only when you explicitly ask:
 
 ```bash
-python3 scripts/agent_contracts.py init --repo .
-python3 scripts/agent_contracts.py init --repo . --write --yes
-python3 scripts/agent_contracts.py init --repo . --write --yes --overwrite-existing
+agent-contracts init --repo . --write --yes --overwrite-existing
 ```
 
-Default behavior is conservative:
+### 2. Build A Context Pack
 
-- The first run previews planned files and writes nothing.
-- `--write --yes` writes new files and skips existing files.
-- `--overwrite-existing` is required to replace existing files.
-
-### `/contract-check`
-
-Read-only drift analysis.
-
-Direct script:
+Create a bounded local bundle for a module or task:
 
 ```bash
-python3 scripts/agent_contracts.py check --repo .
-python3 scripts/agent_contracts.py check --repo . --format json
+agent-contracts context-pack billing --repo .
+agent-contracts context-pack "fix payment status tests" --repo .
 ```
 
-It can report:
+Context packs include relevant contracts, instructions, owned source files, tests, and direct dependency contract summaries when present.
 
-- Missing `SPEC.md`.
-- Missing or stale `AGENTS.md`.
-- Orphan files not covered by any declared module path.
-- Undeclared module dependencies.
-- Missing dependency contracts.
-- Imports from another module's `internal/` or `private/` files.
-- Public surfaces missing from `SPEC.md`.
-- Missing test evidence for declared capabilities.
+### 3. Check For Drift
 
-### `/contract-refresh`
-
-Plans updates after code changes.
-
-Direct script:
+Compare contracts against current code evidence:
 
 ```bash
-python3 scripts/agent_contracts.py refresh --repo .
-python3 scripts/agent_contracts.py refresh --repo . --write-safe --yes
-python3 scripts/agent_contracts.py refresh --repo . --write-safe --write-contract --yes
+agent-contracts check --repo .
 ```
 
-Refresh separates:
+This reports issues such as undeclared dependencies, internal imports, missing contracts, missing agent instructions, uncovered files, and public surfaces missing from `SPEC.md`.
 
-- Safe instruction refreshes: generated module-map and agent-instruction updates.
-- Contract-changing updates: `SPEC.md` changes that can alter public surface, dependencies, or acceptance criteria.
+### 4. Refresh After Code Changes
 
-Review contract-changing updates before applying them.
-
-### `/context-pack <module-or-task>`
-
-Builds a bounded local bundle for a module or task.
-
-Direct script:
+Plan updates after the repo changes:
 
 ```bash
-python3 scripts/agent_contracts.py context-pack billing --repo .
-python3 scripts/agent_contracts.py context-pack "fix payment status tests" --repo .
+agent-contracts refresh --repo .
 ```
 
-Context packs include relevant contracts, instructions, owned source files, tests, and direct dependency contract summaries when present. They exclude unrelated sibling modules, dependency internals, generated output, vendor files, build output, and caches by default.
-
-## Fixture Walkthrough
-
-Try the Python fixture from this plugin repo:
+Apply safe instruction refreshes:
 
 ```bash
-python3 scripts/agent_contracts.py doctor --repo fixtures/python-service
-python3 scripts/agent_contracts.py map --repo fixtures/python-service
-python3 scripts/agent_contracts.py init --repo fixtures/python-service
-python3 scripts/agent_contracts.py check --repo fixtures/broken-drift
+agent-contracts refresh --repo . --write-safe --yes
 ```
 
-The Python fixture detects `auth`, `billing`, and `root` modules. The broken-drift fixture intentionally reports an internal import, undeclared dependency, missing contracts, and missing agent instructions.
-
-## Current Capabilities
-
-The analyzer currently supports:
-
-- File inventory with generated/vendor/build/cache exclusions.
-- Python import and public function/class detection.
-- JavaScript and TypeScript import/export detection.
-- Basic HTTP route detection for Python and JavaScript/TypeScript patterns.
-- Package and command hints from `package.json`, `pyproject.toml`, `Makefile`, and README snippets.
-- Root-level tests associated with modules by local evidence.
-- Deterministic Markdown and JSON output.
-- Local drift reports and bounded context packs.
-
-## Current Limitations
-
-This is a local Phase 1 implementation. It deliberately does not include:
-
-- CI/CD integration.
-- Hosted dashboards.
-- Source upload.
-- External API calls.
-- Automatic commits, pushes, pull requests, or merges.
-- Execution of target repository code.
-- Dependency installation.
-- Full language-server precision.
-- Specialized Phase 2 contract-maintenance agents.
-- A Codex adapter package.
-
-When evidence is incomplete, the analyzer reports confidence and boundary notes instead of pretending certainty.
-
-## Safety Model
-
-Read-only commands stay read-only. Write commands require explicit flags and should be run only after reviewing the preview.
-
-The analyzer does not execute target repository code. It reads text files, manifests, tests, docs, and configs, then produces local artifacts.
-
-See `PRIVACY.md` and `SECURITY.md` for the local-only safety posture.
-
-## Validation
-
-Run:
+Apply contract-changing updates only after review:
 
 ```bash
-python3 scripts/validate_plugin.py
-python3 -m unittest discover -s tests
+agent-contracts refresh --repo . --write-safe --write-contract --yes
 ```
 
-Fixtures cover Python, TypeScript, mixed monorepo, existing-document handling, ambiguous module names, overwrite behavior, context packs, and intentionally broken drift cases.
+### 5. Inspect The Map
+
+Show the detected ownership and dependency map without writing files:
+
+```bash
+agent-contracts map --repo .
+```
+
+### 6. Troubleshoot Setup
+
+Use doctor when installation or repository readiness looks off:
+
+```bash
+agent-contracts doctor --repo .
+```
+
+Doctor checks plugin layout, Python availability, Git state, permissions, ignore rules, and whether the repo can be inventoried locally.

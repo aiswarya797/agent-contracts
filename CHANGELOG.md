@@ -7,4 +7,6 @@
 - Added deterministic local analyzer for module maps, initialization, drift checks, refresh planning, and context packs.
 - Added Python, TypeScript, mixed monorepo, existing-docs, ambiguous-module, and drift fixtures.
 - Added generated examples, stricter validation, and unit tests.
-- Expanded README with install, quick start, command reference, fixture walkthrough, capabilities, limitations, and safety model.
+- Expanded README with a user-facing intro, install flow, generated-artifact summary, and command reference.
+- Added npm package metadata and the `agent-contracts` CLI launcher.
+- Reworked the README introduction, install flow, and command order for first-time users.
