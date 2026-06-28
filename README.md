@@ -1,19 +1,34 @@
 <p align="center">
-  <picture>
-    <source srcset="assets/agent-contracts-wordmark-dark.svg" media="(prefers-color-scheme: dark)">
-    <source srcset="assets/agent-contracts-wordmark-light.svg" media="(prefers-color-scheme: light)">
-    <img src="assets/agent-contracts-wordmark-light.svg" alt="agent-contracts" width="390">
-  </picture>
+  <a href="https://github.com/aiswarya797/agent-contracts">
+    <picture>
+      <source srcset="assets/agent-contracts-wordmark-dark.svg" media="(prefers-color-scheme: dark)">
+      <source srcset="assets/agent-contracts-wordmark-light.svg" media="(prefers-color-scheme: light)">
+      <img src="assets/agent-contracts-wordmark-light.svg" alt="agent-contracts logo" width="390">
+    </picture>
+  </a>
 </p>
 
-<p align="center">Local contracts that keep AI coding agents inside the shape of your repo.</p>
+<div align="center">
+  <p><strong>Keep AI coding agents inside the shape of your repo.</strong></p>
 
-<p align="center">
-  <a href="#why-this-is-needed">Why</a> |
-  <a href="#what-it-generates">Output</a> |
-  <a href="#how-to-install">Install</a> |
-  <a href="#commands">Commands</a>
-</p>
+  <p>Generate local contracts, agent instructions, context packs, and drift checks from real code evidence.</p>
+
+  <p>
+    <a href="https://www.npmjs.com/package/agent-contracts-cli"><img alt="npm version" src="https://img.shields.io/npm/v/agent-contracts-cli.svg" /></a>
+    <a href="https://www.npmjs.com/package/agent-contracts-cli"><img alt="npm downloads" src="https://img.shields.io/npm/dm/agent-contracts-cli.svg" /></a>
+    <a href="https://github.com/aiswarya797/agent-contracts/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/aiswarya797/agent-contracts.svg" /></a>
+    <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg" /></a>
+  </p>
+
+  <p>
+    <a href="#why-this-is-needed">Why this is needed</a> |
+    <a href="#what-it-generates">What it generates</a> |
+    <a href="#how-to-install">How to install</a> |
+    <a href="#commands">Commands</a>
+  </p>
+</div>
+
+---
 
 `agent-contracts` turns the implicit rules of a codebase into local, reviewable files that both humans and AI coding agents can read before making changes.
 

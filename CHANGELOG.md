@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2
+
+- Matched the README header layout to the centered badge style used by `eve-knowledge`.
+- Added npm, downloads, GitHub release, and license badges to the README.
+
 ## 0.1.1
 
 - Refined the README wordmark so the mark and title stay separated in GitHub and npm rendering.
