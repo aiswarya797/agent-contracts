@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+
+- Refined the README wordmark so the mark and title stay separated in GitHub and npm rendering.
+
 ## 0.1.0
 
 - Added Claude Code plugin metadata, skills, and command wrappers.
