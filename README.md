@@ -3,7 +3,7 @@
     <picture>
       <source srcset="assets/agent-contracts-wordmark-dark.svg" media="(prefers-color-scheme: dark)">
       <source srcset="assets/agent-contracts-wordmark-light.svg" media="(prefers-color-scheme: light)">
-      <img src="assets/agent-contracts-wordmark-light.svg" alt="agent-contracts logo" width="390">
+      <img src="assets/agent-contracts-wordmark-light.svg" alt="agent-contracts logo" width="520">
     </picture>
   </a>
 </p>

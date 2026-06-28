@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+- Increased the README wordmark title size and visual weight.
+
 ## 0.1.2
 
 - Matched the README header layout to the centered badge style used by `eve-knowledge`.
