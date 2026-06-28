@@ -58,10 +58,10 @@ Generated files are plain Markdown and JSON. They are meant to be reviewed, edit
 
 ## How To Install
 
-Install today from GitHub through npm:
+Install from npm:
 
 ```bash
-npm install -g github:aiswarya797/agent-contracts
+npm install -g agent-contracts-cli
 ```
 
 Then run it inside any repository:
@@ -70,16 +70,16 @@ Then run it inside any repository:
 agent-contracts init --repo .
 ```
 
-The npm registry package is ready to publish as `agent-contracts-cli` because `agent-contracts` is already taken on npm. After registry publish, install with:
-
-```bash
-npm install -g agent-contracts-cli
-```
-
-The installed command is still:
+The package is named `agent-contracts-cli` because `agent-contracts` was already taken on npm. The installed command is still:
 
 ```bash
 agent-contracts --help
+```
+
+You can also install directly from GitHub:
+
+```bash
+npm install -g github:aiswarya797/agent-contracts
 ```
 
 Python 3.10+ is required. The npm package is a thin launcher around the bundled local Python analyzer.
