@@ -11,7 +11,7 @@
 <div align="center">
   <p><strong>Keep AI coding agents inside the shape of your repo.</strong></p>
 
-  <p>Scan your repo, generate files that show what each part owns and depends on, and give agents the right instructions before they edit.</p>
+  <p>Automatically generate module contracts so agents understand ownership, dependencies, and instructions before they edit.</p>
 
   <p>
     <a href="https://www.npmjs.com/package/agent-contracts-cli"><img alt="npm version" src="https://img.shields.io/npm/v/agent-contracts-cli.svg" /></a>
