@@ -19,6 +19,7 @@ REQUIRED_FILES = [
     "README.md",
     "package.json",
     "bin/agent-contracts.js",
+    "bin/agent-contracts-mcp.js",
     "assets/agent-contracts-wordmark-dark.svg",
     "assets/agent-contracts-wordmark-light.svg",
     "commands/contract-init.md",
@@ -38,6 +39,9 @@ REQUIRED_FILES = [
     "skills/shared/generated-files.md",
     "skills/shared/script-resolution.md",
     "scripts/agent_contracts.py",
+    "scripts/agent_contracts_mcp.py",
+    "scripts/agent_trial_runner_template.py",
+    "validation/context-selection/manifest.jsonl",
 ]
 
 EXPECTED_WORKFLOWS = {
@@ -55,7 +59,13 @@ EXPECTED_CLI_COMMANDS = {
     "check",
     "refresh",
     "doctor",
+    "context-discover",
+    "context-read",
     "context-pack",
+    "verify-context",
+    "benchmark-context",
+    "trial-context",
+    "agent-trial-context",
 }
 
 
@@ -84,8 +94,23 @@ def validate_package() -> None:
     package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
     require(package.get("name") == "agent-contracts-cli", "npm package name must be agent-contracts-cli")
     require(package.get("bin", {}).get("agent-contracts") == "bin/agent-contracts.js", "package bin must expose agent-contracts")
+    require(
+        package.get("bin", {}).get("agent-contracts-mcp") == "bin/agent-contracts-mcp.js",
+        "package bin must expose agent-contracts-mcp",
+    )
     require(package.get("publishConfig", {}).get("access") == "public", "package must publish publicly")
-    for path in [".claude-plugin", "commands", "skills", "scripts/agent_contracts.py", "bin", "assets"]:
+    for path in [
+        ".claude-plugin",
+        "commands",
+        "skills",
+        "scripts/agent_contracts.py",
+        "scripts/agent_contracts_mcp.py",
+        "scripts/agent_trial_runner_template.py",
+        "bin",
+        "assets",
+        "fixtures",
+        "validation",
+    ]:
         require(path in package.get("files", []), f"package files should include {path}")
 
     if shutil.which("node"):
@@ -145,8 +170,9 @@ def validate_gitignore() -> None:
         "__pycache__/",
         ".agent-contracts/cache/",
         ".agent-contracts/context-packs/",
-        "docs/agent-contracts-plugin-prd.md",
-        "docs/agent-contracts-plugin-lld.md",
+        "/benchmark-results/",
+        "/docs/",
+        "/examples/generated/",
     ]
     for entry in required_entries:
         require(entry in text, f".gitignore should include {entry}")
@@ -162,6 +188,10 @@ def validate_generated_examples() -> None:
 def validate_cli() -> None:
     compile_result = run([sys.executable, "-m", "py_compile", "scripts/agent_contracts.py"])
     require(compile_result.returncode == 0, compile_result.stderr)
+    mcp_compile_result = run([sys.executable, "-m", "py_compile", "scripts/agent_contracts_mcp.py"])
+    require(mcp_compile_result.returncode == 0, mcp_compile_result.stderr)
+    runner_compile_result = run([sys.executable, "-m", "py_compile", "scripts/agent_trial_runner_template.py"])
+    require(runner_compile_result.returncode == 0, runner_compile_result.stderr)
 
     help_result = run([sys.executable, "scripts/agent_contracts.py", "--help"])
     require(help_result.returncode == 0, help_result.stderr)
@@ -172,7 +202,15 @@ def validate_cli() -> None:
     require(doctor.returncode == 0, doctor.stderr or doctor.stdout)
     require(json.loads(doctor.stdout)["summary"]["blockers"] == 0, "doctor should report no blockers for plugin repo")
 
-    fixtures = ["python-service", "typescript-app", "mixed-monorepo", "existing-docs", "ambiguous-modules"]
+    fixtures = [
+        "python-service",
+        "typescript-app",
+        "mixed-monorepo",
+        "existing-docs",
+        "ambiguous-modules",
+        "noisy-context",
+        "contract-guided-context",
+    ]
     for fixture in fixtures:
         result = run([sys.executable, "scripts/agent_contracts.py", "map", "--repo", f"fixtures/{fixture}", "--format", "json"])
         require(result.returncode == 0, result.stderr)

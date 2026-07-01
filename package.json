@@ -13,7 +13,8 @@
     "url": "https://github.com/aiswarya797/agent-contracts/issues"
   },
   "bin": {
-    "agent-contracts": "bin/agent-contracts.js"
+    "agent-contracts": "bin/agent-contracts.js",
+    "agent-contracts-mcp": "bin/agent-contracts-mcp.js"
   },
   "files": [
     ".claude-plugin",
@@ -21,8 +22,14 @@
     "bin",
     "commands",
     "examples",
+    "fixtures",
     "scripts/agent_contracts.py",
+    "scripts/agent_contracts_mcp.py",
+    "scripts/agent_trial_runner_template.py",
+    "scripts/swe_explore_agent_contracts.py",
+    "scripts/swe_restricted_repair.py",
     "skills",
+    "validation",
     "CHANGELOG.md",
     "LICENSE",
     "PRIVACY.md",
@@ -30,8 +37,8 @@
     "SECURITY.md"
   ],
   "scripts": {
-    "validate": "python3 scripts/validate_plugin.py",
-    "test": "python3 scripts/validate_plugin.py && python3 -m unittest discover -s tests",
+    "validate": "node bin/run-python.js scripts/validate_plugin.py",
+    "test": "node bin/run-python.js scripts/validate_plugin.py && node bin/run-python.js -m unittest discover -s tests",
     "pack:dry": "npm pack --dry-run"
   },
   "keywords": [
