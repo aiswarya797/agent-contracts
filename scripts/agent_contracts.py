@@ -40,9 +40,11 @@ MAP_PATH = ".agent-contracts/module-map.json"
 CONTEXT_PACK_ROOT = ".agent-contracts/context-packs"
 MODULE_MAP_CACHE_SCHEMA_VERSION = 1
 MODULE_MAP_CACHE_ALGORITHM = "module-map-fingerprint-v1"
+CONTEXT_LOCALIZATION_INDEX_CACHE_SCHEMA_VERSION = 1
 MODULE_MAP_CACHE_DIR = ".agent-contracts/cache"
 GIT_MODULE_MAP_CACHE_DIR = "agent-contracts/cache"
-MODULE_MAP_CACHE_ENV = "AGENT_CONTRACTS_DISABLE_CACHE"
+AGENT_CONTRACTS_CACHE_ENV = "AGENT_CONTRACTS_DISABLE_CACHE"
+MODULE_MAP_CACHE_ENV = AGENT_CONTRACTS_CACHE_ENV
 NOW_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 CONTEXT_READ_SECTIONS = {
     "summary",
@@ -76,6 +78,18 @@ CONTEXT_BENCHMARK_SCHEMA_VERSION = "agent-contracts-context-selection-benchmark-
 CONTEXT_TRIAL_SCHEMA_VERSION = "agent-contracts-deterministic-context-trial-v1"
 AGENT_CONTEXT_TRIAL_SCHEMA_VERSION = "agent-contracts-live-context-agent-trial-v1"
 AGENT_CONTEXT_TRIAL_INPUT_SCHEMA_VERSION = "agent-contracts-live-context-agent-input-v1"
+CONTEXT_PACK_V2_SCHEMA_VERSION = 2
+CONTEXT_LOCALIZATION_INDEX_SCHEMA_VERSION = 1
+CONTEXT_LOCALIZATION_ALGORITHM = "context-localization-v1"
+CONTEXT_SEARCH_INDEX_ALGORITHM = "context-search-index-v1"
+CONTEXT_SYMBOL_INDEX_ALGORITHM = "context-symbol-index-v1"
+CONTEXT_TEST_INDEX_ALGORITHM = "context-test-index-v1"
+CONTEXT_LOCALIZATION_INDEX_ALGORITHMS = {
+    "search_index": CONTEXT_SEARCH_INDEX_ALGORITHM,
+    "symbol_index": CONTEXT_SYMBOL_INDEX_ALGORITHM,
+    "test_index": CONTEXT_TEST_INDEX_ALGORITHM,
+}
+MODEL_PROFILE_NAMES = ("spark", "mini", "frontier", "unknown")
 CONTEXT_VERIFIER_STRATEGIES = ("naive", "module", "module-no-contracts")
 CONTEXT_BENCHMARK_STRATEGIES = (
     "naive",
@@ -286,6 +300,55 @@ JS_EXPORT_RE = re.compile(
 )
 MAKE_TARGET_RE = re.compile(r"^([A-Za-z0-9_.-]+):(?:\s|$)", re.M)
 README_COMMAND_RE = re.compile(r"\b((?:npm|pnpm|yarn|python|python3|pytest|make|bun|cargo|go)\s+[^\n`]+)")
+PATH_SIGNAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_/@.-])((?:[A-Za-z0-9_.@+-]+/)+[A-Za-z0-9_.@+-]+\.[A-Za-z0-9_+-]+)(?::(\d+))?"
+)
+TRACEBACK_FILE_RE = re.compile(r"File\s+[\"']([^\"']+)[\"']\s*,\s*line\s+(\d+)")
+QUOTED_TERM_RE = re.compile(r"[`\"']([^`\"'\n]{3,160})[`\"']")
+DOTTED_NAME_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b")
+SYMBOLISH_RE = re.compile(r"\b(?:[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+|[A-Z][A-Za-z0-9]+[A-Z][A-Za-z0-9]+)\b")
+TEST_NAME_RE = re.compile(r"\btest_[A-Za-z0-9_]+\b")
+ERROR_MESSAGE_RE = re.compile(r"([A-Za-z][A-Za-z0-9_]*(?:Error|Exception|Warning|Failure):\s*[^\n]{3,180})")
+NEGATIVE_CONSTRAINT_RE = re.compile(r"\b(?:should not|must not|do not|don't|never|avoid|regression)\b", re.I)
+NOISY_CONTEXT_PARTS = {
+    "vendor",
+    "vendors",
+    "third_party",
+    "third-party",
+    "node_modules",
+    "bower_components",
+    "dist",
+    "build",
+    "coverage",
+    "generated",
+    "gen",
+    "__generated__",
+    "static",
+    "assets",
+}
+VENDORED_CONTEXT_LAYOUT_PARTS = {
+    "_vendor",
+    "_vendored",
+    "vendored",
+    "vendorized",
+    "site-packages",
+    "dist-packages",
+}
+VENDORED_CONTEXT_CONTAINER_PARTS = {
+    "deps",
+    "dependencies",
+    "extern",
+    "external",
+}
+REQUESTS_VENDORED_DEPENDENCY_PARTS = {"urllib3", "chardet", "idna", "certifi"}
+NOISY_CONTEXT_NAMES = {
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "cargo.lock",
+}
+DIRECT_LOCALIZATION_EVIDENCE = {"exact_path", "traceback", "symbol", "test_name", "quoted_string", "error_message"}
 
 
 @dataclasses.dataclass
@@ -339,6 +402,24 @@ class ContextFile:
 
 
 @dataclasses.dataclass
+class IssueSignals:
+    intent: str
+    tokens: list[str]
+    path_hints: list[str]
+    traceback_lines: dict[str, list[int]]
+    dotted_names: list[str]
+    symbols: list[str]
+    test_names: list[str]
+    quoted_terms: list[str]
+    error_messages: list[str]
+    behavior_terms: list[str]
+    negative_terms: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
 class Finding:
     severity: str
     code: str
@@ -352,6 +433,7 @@ class Finding:
 
 
 _MODULE_MAP_MEMORY_CACHE: dict[str, dict[str, Any]] = {}
+_LOCALIZATION_INDEX_MEMORY_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def utc_now() -> str:
@@ -751,9 +833,13 @@ def module_alias_map(modules: list[ModuleInfo]) -> dict[str, ModuleInfo]:
     return package_to_module
 
 
-def module_map_cache_enabled() -> bool:
-    value = os.environ.get(MODULE_MAP_CACHE_ENV, "").strip().lower()
+def agent_contracts_cache_enabled() -> bool:
+    value = os.environ.get(AGENT_CONTRACTS_CACHE_ENV, "").strip().lower()
     return value not in {"1", "true", "yes", "on"}
+
+
+def module_map_cache_enabled() -> bool:
+    return agent_contracts_cache_enabled()
 
 
 def git_private_cache_dir(git_root: Path) -> Path | None:
@@ -775,30 +861,24 @@ def git_private_cache_dir(git_root: Path) -> Path | None:
     return git_dir / GIT_MODULE_MAP_CACHE_DIR
 
 
-def module_map_cache_path(repo: Path) -> Path:
+def agent_contracts_cache_dir(repo: Path) -> Path:
     resolved_repo = repo.resolve()
     git_root = find_git_root(resolved_repo)
     cache_dir = git_private_cache_dir(git_root) if git_root else None
     if cache_dir is None:
         cache_dir = resolved_repo / MODULE_MAP_CACHE_DIR
+    return cache_dir
+
+
+def module_map_cache_path(repo: Path) -> Path:
+    resolved_repo = repo.resolve()
+    cache_dir = agent_contracts_cache_dir(resolved_repo)
     repo_digest = hashlib.sha1(resolved_repo.as_posix().encode("utf-8")).hexdigest()[:12]
     return cache_dir / f"module-map-{repo_digest}.json"
 
 
 def module_map_fingerprint(repo: Path, files: list[FileInfo]) -> dict[str, Any]:
-    digest = hashlib.sha256()
-    digest.update(MODULE_MAP_CACHE_ALGORITHM.encode("utf-8"))
-    digest.update(b"\0")
-    digest.update(repo.resolve().as_posix().encode("utf-8"))
-    for file in sorted(files, key=lambda item: item.path):
-        digest.update(b"\0")
-        digest.update(file.path.encode("utf-8", errors="surrogateescape"))
-        digest.update(f":{file.size}:{file.mtime_ns}:{file.language}:{file.role}".encode("utf-8"))
-    return {
-        "algorithm": MODULE_MAP_CACHE_ALGORITHM,
-        "file_count": len(files),
-        "digest": digest.hexdigest(),
-    }
+    return context_index_fingerprint(repo, files, MODULE_MAP_CACHE_ALGORITHM)
 
 
 def read_cached_module_map(repo: Path, fingerprint: dict[str, Any]) -> dict[str, Any] | None:
@@ -850,9 +930,78 @@ def clear_module_map_cache() -> None:
     _MODULE_MAP_MEMORY_CACHE.clear()
 
 
-def build_module_map(repo: Path, *, use_cache: bool = True) -> dict[str, Any]:
+def localization_index_cache_path(repo: Path, index_name: str) -> Path:
+    if index_name not in CONTEXT_LOCALIZATION_INDEX_ALGORITHMS:
+        raise ValueError(f"unknown localization index: {index_name}")
+    resolved_repo = repo.resolve()
+    repo_digest = hashlib.sha1(resolved_repo.as_posix().encode("utf-8")).hexdigest()[:12]
+    safe_index_name = index_name.replace("_", "-")
+    return agent_contracts_cache_dir(resolved_repo) / f"context-{safe_index_name}-{repo_digest}.json"
+
+
+def read_cached_localization_index(repo: Path, index_name: str, fingerprint: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    if not agent_contracts_cache_enabled():
+        return None, "disabled"
+    cache_path = localization_index_cache_path(repo, index_name)
+    cache_key = cache_path.as_posix()
+    memory_hit = _LOCALIZATION_INDEX_MEMORY_CACHE.get(cache_key)
+    if memory_hit and memory_hit.get("fingerprint") == fingerprint:
+        index_data = memory_hit.get("index")
+        if isinstance(index_data, dict):
+            return index_data, "memory_hit"
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, "miss"
+    if payload.get("schema_version") != CONTEXT_LOCALIZATION_INDEX_CACHE_SCHEMA_VERSION:
+        return None, "stale"
+    if payload.get("index_schema_version") != CONTEXT_LOCALIZATION_INDEX_SCHEMA_VERSION:
+        return None, "stale"
+    if payload.get("index_name") != index_name:
+        return None, "stale"
+    if payload.get("algorithm") != CONTEXT_LOCALIZATION_INDEX_ALGORITHMS[index_name]:
+        return None, "stale"
+    if payload.get("fingerprint") != fingerprint:
+        return None, "stale"
+    index_data = payload.get("index")
+    if not isinstance(index_data, dict):
+        return None, "stale"
+    _LOCALIZATION_INDEX_MEMORY_CACHE[cache_key] = {"fingerprint": fingerprint, "index": index_data}
+    return index_data, "disk_hit"
+
+
+def write_cached_localization_index(repo: Path, index_name: str, fingerprint: dict[str, Any], index_data: dict[str, Any]) -> None:
+    if not agent_contracts_cache_enabled():
+        return
+    cache_path = localization_index_cache_path(repo, index_name)
+    payload = {
+        "schema_version": CONTEXT_LOCALIZATION_INDEX_CACHE_SCHEMA_VERSION,
+        "index_schema_version": CONTEXT_LOCALIZATION_INDEX_SCHEMA_VERSION,
+        "product": PRODUCT,
+        "created_at": utc_now(),
+        "repo_root": repo.resolve().as_posix(),
+        "index_name": index_name,
+        "algorithm": CONTEXT_LOCALIZATION_INDEX_ALGORITHMS[index_name],
+        "fingerprint": fingerprint,
+        "index": index_data,
+    }
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(cache_path)
+    except OSError:
+        return
+    _LOCALIZATION_INDEX_MEMORY_CACHE[cache_path.as_posix()] = {"fingerprint": fingerprint, "index": index_data}
+
+
+def clear_localization_index_cache() -> None:
+    _LOCALIZATION_INDEX_MEMORY_CACHE.clear()
+
+
+def build_module_map(repo: Path, *, use_cache: bool = True, files: list[FileInfo] | None = None) -> dict[str, Any]:
     repo = repo.resolve()
-    files = inventory(repo)
+    files = files if files is not None else inventory(repo)
     fingerprint = module_map_fingerprint(repo, files)
     if use_cache:
         cached = read_cached_module_map(repo, fingerprint)
@@ -1725,6 +1874,1488 @@ def context_target_tokens(target: str) -> list[str]:
         for token in re.findall(r"[a-z0-9]+", target.lower())
         if len(token) > 1 and token not in CONTEXT_TARGET_STOP_WORDS
     ]
+
+
+def context_signal_tokens(value: str) -> list[str]:
+    expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
+    expanded = expanded.replace("_", " ").replace("-", " ").replace(".", " ").replace("/", " ")
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", expanded.lower())
+        if len(token) > 1 and token not in CONTEXT_TARGET_STOP_WORDS
+    ]
+
+
+def context_unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        normalized = item.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def normalize_signal_path(value: str) -> str:
+    cleaned = value.strip().strip("`'\".,);]")
+    cleaned = cleaned.replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    if "://" in cleaned:
+        return ""
+    return cleaned
+
+
+def path_hint_matches(candidate: str, hint: str) -> bool:
+    normalized = normalize_signal_path(hint).lstrip("/")
+    candidate = candidate.strip("/")
+    if not normalized:
+        return False
+    return (
+        candidate == normalized
+        or candidate.endswith("/" + normalized)
+        or normalized.endswith("/" + candidate)
+        or Path(candidate).name == normalized
+    )
+
+
+def classify_task_intent(task_text: str) -> str:
+    lowered = task_text.lower()
+    if re.search(r"\b(review|pr|pull request|diff|regression risk)\b", lowered):
+        return "review"
+    if re.search(r"\b(refactor|rename|cleanup|simplify|extract)\b", lowered):
+        return "refactor"
+    if re.search(r"\b(document|documentation|docs|readme|guide)\b", lowered):
+        return "docs"
+    if re.search(r"\b(add|update|write).{0,30}\btests?\b|\btests?\s+(?:for|around)\b", lowered):
+        return "test"
+    if re.search(r"\b(fix|bug|error|exception|traceback|failure|fails|failing|regression|incorrect|broken)\b", lowered):
+        return "bugfix"
+    if lowered.strip().endswith("?") or re.search(r"\b(how|why|what|where|which)\b", lowered):
+        return "qna"
+    return "unknown"
+
+
+def extract_issue_signals(task_text: str) -> IssueSignals:
+    path_hints: list[str] = []
+    traceback_lines: dict[str, list[int]] = {}
+    for raw_path, raw_line in PATH_SIGNAL_RE.findall(task_text):
+        path = normalize_signal_path(raw_path)
+        if path:
+            path_hints.append(path)
+            if raw_line:
+                traceback_lines.setdefault(path, []).append(int(raw_line))
+    for raw_path, raw_line in TRACEBACK_FILE_RE.findall(task_text):
+        path = normalize_signal_path(raw_path)
+        if path:
+            path_hints.append(path)
+            traceback_lines.setdefault(path, []).append(int(raw_line))
+
+    quoted_terms = [
+        term.strip()
+        for term in QUOTED_TERM_RE.findall(task_text)
+        if term.strip() and not PATH_SIGNAL_RE.search(term.strip())
+    ]
+    dotted_names = [
+        name
+        for name in DOTTED_NAME_RE.findall(task_text)
+        if not name.startswith(("http.", "https."))
+        and f".{name.rsplit('.', 1)[-1].lower()}" not in TEXT_EXTENSIONS
+    ]
+    symbol_terms = [name.rsplit(".", 1)[-1] for name in dotted_names]
+    symbol_terms.extend(SYMBOLISH_RE.findall(task_text))
+    symbol_terms.extend(TEST_NAME_RE.findall(task_text))
+    for term in quoted_terms:
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", term):
+            symbol_terms.append(term)
+
+    error_messages = [message.strip() for message in ERROR_MESSAGE_RE.findall(task_text)]
+    tokens = context_signal_tokens(task_text)
+    path_tokens = set(context_signal_tokens(" ".join(path_hints)))
+    symbol_tokens = set(context_signal_tokens(" ".join(symbol_terms + dotted_names)))
+    behavior_terms = [
+        token
+        for token in tokens
+        if token not in path_tokens
+        and token not in symbol_tokens
+        and token not in {"fix", "bug", "error", "exception", "traceback", "failure", "fails", "failing"}
+    ]
+    negative_terms = [match.group(0).lower() for match in NEGATIVE_CONSTRAINT_RE.finditer(task_text)]
+
+    return IssueSignals(
+        intent=classify_task_intent(task_text),
+        tokens=context_unique(tokens),
+        path_hints=context_unique(path_hints),
+        traceback_lines={path: sorted(set(lines)) for path, lines in sorted(traceback_lines.items())},
+        dotted_names=context_unique(dotted_names),
+        symbols=context_unique(symbol_terms),
+        test_names=context_unique(TEST_NAME_RE.findall(task_text)),
+        quoted_terms=context_unique(quoted_terms),
+        error_messages=context_unique(error_messages),
+        behavior_terms=context_unique(behavior_terms)[:24],
+        negative_terms=context_unique(negative_terms),
+    )
+
+
+def context_index_fingerprint(repo: Path, files: list[FileInfo], algorithm: str, *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    digest.update(algorithm.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(repo.resolve().as_posix().encode("utf-8"))
+    for file in sorted(files, key=lambda item: item.path):
+        digest.update(b"\0")
+        digest.update(f"{file.path}:{file.size}:{file.mtime_ns}:{file.language}:{file.role}".encode("utf-8"))
+    if extra:
+        digest.update(b"\0")
+        digest.update(json.dumps(extra, sort_keys=True).encode("utf-8"))
+    fingerprint = {"algorithm": algorithm, "file_count": len(files), "digest": digest.hexdigest()}
+    if extra:
+        fingerprint["extra"] = extra
+    return fingerprint
+
+
+def localization_index_fingerprint(repo: Path, files: list[FileInfo], algorithm: str) -> dict[str, Any]:
+    return context_index_fingerprint(
+        repo,
+        files,
+        algorithm,
+        extra={"schema_version": CONTEXT_LOCALIZATION_INDEX_SCHEMA_VERSION},
+    )
+
+
+def context_file_role_for_path(repo: Path, path: str) -> str:
+    language = LANG_BY_EXT.get(Path(path).suffix, "")
+    return classify_file(path, language)
+
+
+def build_cached_localization_index(
+    repo: Path,
+    index_name: str,
+    files: list[FileInfo] | None,
+    builder: Any,
+    *,
+    use_cache: bool = True,
+) -> tuple[dict[str, Any], str]:
+    repo = repo.resolve()
+    files = files if files is not None else inventory(repo)
+    algorithm = CONTEXT_LOCALIZATION_INDEX_ALGORITHMS[index_name]
+    fingerprint = localization_index_fingerprint(repo, files, algorithm)
+    cache_active = use_cache and agent_contracts_cache_enabled()
+    if use_cache:
+        cached, status = read_cached_localization_index(repo, index_name, fingerprint)
+        if cached is not None:
+            return cached, status
+    index_data = builder(repo, files, fingerprint=fingerprint)
+    if use_cache:
+        write_cached_localization_index(repo, index_name, fingerprint, index_data)
+    if not use_cache:
+        return index_data, "bypassed"
+    if not cache_active:
+        return index_data, "disabled"
+    return index_data, "recomputed"
+
+
+def build_repo_search_index_from_files(repo: Path, files: list[FileInfo], *, fingerprint: dict[str, Any] | None = None) -> dict[str, Any]:
+    repo = repo.resolve()
+    entries: dict[str, dict[str, Any]] = {}
+    for file in sorted(files, key=lambda item: item.path):
+        text = safe_read(repo / file.path, limit=1_000_000)
+        path_tokens = context_signal_tokens(file.path)
+        content_tokens = context_signal_tokens(text[:200_000])
+        entries[file.path] = {
+            "path": file.path,
+            "role": file.role,
+            "language": file.language,
+            "size": file.size,
+            "mtime_ns": file.mtime_ns,
+            "line_count": len(text.splitlines()) if text else 0,
+            "path_tokens": sorted(set(path_tokens)),
+            "content_tokens": sorted(set(content_tokens)),
+        }
+    return {
+        "schema_version": CONTEXT_LOCALIZATION_INDEX_SCHEMA_VERSION,
+        "algorithm": CONTEXT_SEARCH_INDEX_ALGORITHM,
+        "repo_root": repo.as_posix(),
+        "fingerprint": fingerprint or localization_index_fingerprint(repo, files, CONTEXT_SEARCH_INDEX_ALGORITHM),
+        "entries": entries,
+    }
+
+
+def build_repo_search_index(repo: Path, files: list[FileInfo] | None = None, *, use_cache: bool = True) -> dict[str, Any]:
+    index_data, _freshness = build_cached_localization_index(
+        repo,
+        "search_index",
+        files,
+        build_repo_search_index_from_files,
+        use_cache=use_cache,
+    )
+    return index_data
+
+
+def python_symbol_records(repo: Path, file: FileInfo) -> list[dict[str, Any]]:
+    text = safe_read(repo / file.path, limit=1_000_000)
+    if not text:
+        return []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    records: list[dict[str, Any]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            records.append(
+                {
+                    "name": node.name,
+                    "kind": "class" if isinstance(node, ast.ClassDef) else "function",
+                    "path": file.path,
+                    "start": int(getattr(node, "lineno", 1)),
+                    "end": int(getattr(node, "end_lineno", getattr(node, "lineno", 1))),
+                    "tokens": sorted(set(context_signal_tokens(node.name))),
+                }
+            )
+    return records
+
+
+def regex_symbol_records(repo: Path, file: FileInfo) -> list[dict[str, Any]]:
+    text = safe_read(repo / file.path, limit=1_000_000)
+    if not text:
+        return []
+    patterns = [
+        ("class", re.compile(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)")),
+        ("function", re.compile(r"\b(?:def|function)\s+([A-Za-z_][A-Za-z0-9_]*)")),
+        ("function", re.compile(r"\b(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\(")),
+        ("export", JS_EXPORT_RE),
+    ]
+    records: list[dict[str, Any]] = []
+    lines = text.splitlines()
+    for kind, pattern in patterns:
+        for match in pattern.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
+            end = min(len(lines), line + 12)
+            name = match.group(1)
+            records.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "path": file.path,
+                    "start": line,
+                    "end": end,
+                    "tokens": sorted(set(context_signal_tokens(name))),
+                }
+            )
+    deduped: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for record in records:
+        deduped[(record["name"], record["path"], record["start"])] = record
+    return [deduped[key] for key in sorted(deduped)]
+
+
+def build_symbol_index_from_files(repo: Path, files: list[FileInfo], *, fingerprint: dict[str, Any] | None = None) -> dict[str, Any]:
+    repo = repo.resolve()
+    symbols: dict[str, list[dict[str, Any]]] = {}
+    by_path: dict[str, list[dict[str, Any]]] = {}
+    for file in sorted(files, key=lambda item: item.path):
+        if file.role not in {"source", "test"}:
+            continue
+        records = python_symbol_records(repo, file) if file.language == "python" else regex_symbol_records(repo, file)
+        for record in records:
+            symbols.setdefault(record["name"], []).append(record)
+            by_path.setdefault(file.path, []).append(record)
+    for records in symbols.values():
+        records.sort(key=lambda item: (item["path"], item["start"], item["name"]))
+    for records in by_path.values():
+        records.sort(key=lambda item: (item["start"], item["name"]))
+    return {
+        "schema_version": CONTEXT_LOCALIZATION_INDEX_SCHEMA_VERSION,
+        "algorithm": CONTEXT_SYMBOL_INDEX_ALGORITHM,
+        "repo_root": repo.as_posix(),
+        "fingerprint": fingerprint or localization_index_fingerprint(repo, files, CONTEXT_SYMBOL_INDEX_ALGORITHM),
+        "symbols": symbols,
+        "by_path": by_path,
+    }
+
+
+def build_symbol_index(repo: Path, files: list[FileInfo] | None = None, *, use_cache: bool = True) -> dict[str, Any]:
+    index_data, _freshness = build_cached_localization_index(
+        repo,
+        "symbol_index",
+        files,
+        build_symbol_index_from_files,
+        use_cache=use_cache,
+    )
+    return index_data
+
+
+def build_test_index_from_files(repo: Path, files: list[FileInfo], *, fingerprint: dict[str, Any] | None = None) -> dict[str, Any]:
+    repo = repo.resolve()
+    test_files = [file for file in files if file.role == "test"]
+    source_files = [file for file in files if file.role == "source"]
+    source_terms: dict[str, set[str]] = {}
+    for source in source_files:
+        terms = set(context_signal_tokens(Path(source.path).with_suffix("").as_posix()))
+        terms.update(context_signal_tokens(Path(source.path).stem))
+        if Path(source.path).stem in {"index", "__init__"}:
+            terms.update(context_signal_tokens(Path(source.path).parent.as_posix()))
+        source_terms[source.path] = terms
+
+    test_to_sources: dict[str, list[str]] = {}
+    source_to_tests: dict[str, list[str]] = {}
+    test_names_by_path: dict[str, list[str]] = {}
+    for test in test_files:
+        text = safe_read(repo / test.path, limit=1_000_000)
+        test_tokens = set(context_signal_tokens(test.path))
+        test_tokens.update(context_signal_tokens(text[:200_000]))
+        imports = import_strings(repo, test)
+        test_tokens.update(context_signal_tokens(" ".join(imports)))
+        test_names_by_path[test.path] = sorted(set(TEST_NAME_RE.findall(text)))
+        matches: list[tuple[int, str]] = []
+        for source_path, terms in source_terms.items():
+            overlap = terms & test_tokens
+            if not overlap:
+                continue
+            score = len(overlap)
+            source_stem = Path(source_path).stem.lower()
+            if source_stem != "__init__" and source_stem in test.path.lower():
+                score += 4
+            if source_stem != "__init__" and re.search(rf"\b{re.escape(source_stem)}\b", text, re.I):
+                score += 3
+            matches.append((score, source_path))
+        matches.sort(key=lambda item: (-item[0], item[1]))
+        paired = [path for _score, path in matches[:5]]
+        if paired:
+            test_to_sources[test.path] = paired
+            for source_path in paired:
+                source_to_tests.setdefault(source_path, []).append(test.path)
+    for tests in source_to_tests.values():
+        tests.sort()
+    return {
+        "schema_version": CONTEXT_LOCALIZATION_INDEX_SCHEMA_VERSION,
+        "algorithm": CONTEXT_TEST_INDEX_ALGORITHM,
+        "repo_root": repo.as_posix(),
+        "fingerprint": fingerprint or localization_index_fingerprint(repo, files, CONTEXT_TEST_INDEX_ALGORITHM),
+        "test_to_sources": {path: sorted(paths) for path, paths in sorted(test_to_sources.items())},
+        "source_to_tests": {path: sorted(paths) for path, paths in sorted(source_to_tests.items())},
+        "test_names_by_path": test_names_by_path,
+    }
+
+
+def build_test_index(repo: Path, files: list[FileInfo] | None = None, *, use_cache: bool = True) -> dict[str, Any]:
+    index_data, _freshness = build_cached_localization_index(
+        repo,
+        "test_index",
+        files,
+        build_test_index_from_files,
+        use_cache=use_cache,
+    )
+    return index_data
+
+
+def build_context_localization_indexes(
+    repo: Path,
+    files: list[FileInfo] | None = None,
+    *,
+    include: tuple[str, ...] = ("search_index", "symbol_index", "test_index"),
+    use_cache: bool = True,
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    repo = repo.resolve()
+    files = files if files is not None else inventory(repo)
+    builders = {
+        "search_index": build_repo_search_index_from_files,
+        "symbol_index": build_symbol_index_from_files,
+        "test_index": build_test_index_from_files,
+    }
+    indexes: dict[str, dict[str, Any]] = {}
+    freshness: dict[str, str] = {}
+    for index_name in include:
+        if index_name not in builders:
+            raise ValueError(f"unknown localization index: {index_name}")
+        indexes[index_name], freshness[index_name] = build_cached_localization_index(
+            repo,
+            index_name,
+            files,
+            builders[index_name],
+            use_cache=use_cache,
+        )
+    return indexes, freshness
+
+
+def context_path_risk_flags(path: str, role: str | None = None) -> list[str]:
+    path_obj = Path(path)
+    lowered_parts = {part.lower() for part in path_obj.parts}
+    lowered_name = path_obj.name.lower()
+    flags: list[str] = []
+    if lowered_parts & NOISY_CONTEXT_PARTS or is_vendored_dependency_layout_path(path):
+        flags.append("vendor_generated_static")
+    if lowered_name in NOISY_CONTEXT_NAMES or lowered_name.endswith((".min.js", ".min.css", ".map")):
+        flags.append("generated_or_minified")
+    if is_generated_path(path):
+        flags.append("generated")
+    if role == "docs" or path_obj.suffix.lower() in {".md", ".rst"}:
+        flags.append("docs")
+    if role == "config":
+        flags.append("config")
+    return context_unique(flags)
+
+
+def is_vendored_dependency_layout_path(path: str) -> bool:
+    parts = [part.lower() for part in Path(path).parts]
+    if not parts:
+        return False
+    if any(part in VENDORED_CONTEXT_LAYOUT_PARTS for part in parts):
+        return True
+    for index, part in enumerate(parts[:-1]):
+        if part == "packages":
+            if (
+                index > 0
+                and parts[index - 1] == "requests"
+                and index + 1 < len(parts)
+                and parts[index + 1] in REQUESTS_VENDORED_DEPENDENCY_PARTS
+            ):
+                return True
+            continue
+        if part not in VENDORED_CONTEXT_CONTAINER_PARTS:
+            continue
+        if index == 0 and index + 1 < len(parts):
+            return True
+    return False
+
+
+def direct_path_evidence_for(path: str, signals: IssueSignals) -> bool:
+    return any(path_hint_matches(path, hint) for hint in signals.path_hints)
+
+
+def resolve_signal_path(repo: Path, hint: str, known_paths: set[str]) -> str | None:
+    if not hint:
+        return None
+    for path in sorted(known_paths):
+        if path_hint_matches(path, hint):
+            return path
+    raw = hint.strip().replace("\\", "/")
+    raw_path = Path(raw)
+    if raw_path.is_absolute():
+        try:
+            relative = raw_path.resolve().relative_to(repo.resolve()).as_posix()
+        except (OSError, ValueError):
+            relative = raw_path.as_posix().lstrip("/")
+    else:
+        relative = normalize_signal_path(raw)
+    if not relative or relative.startswith("../"):
+        return None
+    candidate = repo / relative
+    if candidate.is_file() and is_text_file(candidate):
+        return relative
+    return None
+
+
+def add_candidate_score(
+    candidates: dict[str, dict[str, Any]],
+    repo: Path,
+    path: str,
+    score: int,
+    *,
+    kind: str,
+    value: str,
+    role: str | None = None,
+    line: int | None = None,
+) -> None:
+    if not (repo / path).is_file():
+        return
+    role = role or context_file_role_for_path(repo, path)
+    candidate = candidates.setdefault(
+        path,
+        {"path": path, "role": role, "score": 0, "evidence": [], "risk_flags": context_path_risk_flags(path, role)},
+    )
+    candidate["score"] += score
+    evidence = {"kind": kind, "value": value, "weight": score}
+    if line is not None:
+        evidence["line"] = line
+    candidate["evidence"].append(evidence)
+
+
+def candidate_confidence(candidate: dict[str, Any]) -> str:
+    evidence_kinds = {item.get("kind") for item in candidate.get("evidence", [])}
+    score = int(candidate.get("score", 0))
+    if evidence_kinds & {"exact_path", "traceback"}:
+        return "strong"
+    if "symbol" in evidence_kinds and score >= 500:
+        return "strong"
+    if (evidence_kinds & DIRECT_LOCALIZATION_EVIDENCE) and score >= 350:
+        return "medium"
+    if score >= 420:
+        return "medium"
+    return "weak"
+
+
+def evidence_strength(evidence: list[dict[str, Any]], score: int) -> str:
+    kinds = {item.get("kind") for item in evidence}
+    if kinds & {"exact_path", "traceback"}:
+        return "strong"
+    if "symbol" in kinds and score >= 300:
+        return "strong"
+    if len(kinds & DIRECT_LOCALIZATION_EVIDENCE) >= 2:
+        return "strong"
+    if kinds & DIRECT_LOCALIZATION_EVIDENCE or score >= 220:
+        return "medium"
+    return "weak"
+
+
+def rank_context_files(
+    repo: Path,
+    signals: IssueSignals,
+    modules: list[ModuleInfo],
+    search_index: dict[str, Any],
+    symbol_index: dict[str, Any],
+    test_index: dict[str, Any],
+    *,
+    max_candidate_files: int = 24,
+) -> list[dict[str, Any]]:
+    entries: dict[str, dict[str, Any]] = search_index.get("entries", {})
+    known_paths = set(entries)
+    candidates: dict[str, dict[str, Any]] = {}
+
+    for hint in signals.path_hints:
+        path = resolve_signal_path(repo, hint, known_paths)
+        if path:
+            add_candidate_score(candidates, repo, path, 1000, kind="exact_path", value=hint)
+    for hint, lines in signals.traceback_lines.items():
+        path = resolve_signal_path(repo, hint, known_paths)
+        if not path:
+            continue
+        for line in lines:
+            add_candidate_score(candidates, repo, path, 900, kind="traceback", value=hint, line=line)
+
+    symbol_names = set(signals.symbols)
+    symbol_names.update(name.rsplit(".", 1)[-1] for name in signals.dotted_names)
+    for symbol in sorted(symbol_names):
+        if not symbol:
+            continue
+        records = symbol_index.get("symbols", {}).get(symbol, [])
+        if not records:
+            normalized_symbol = set(context_signal_tokens(symbol))
+            for name, name_records in symbol_index.get("symbols", {}).items():
+                if normalized_symbol and normalized_symbol <= set(context_signal_tokens(name)):
+                    records.extend(name_records)
+        for record in records[:12]:
+            add_candidate_score(
+                candidates,
+                repo,
+                record["path"],
+                560,
+                kind="symbol",
+                value=symbol,
+                line=int(record.get("start", 1)),
+            )
+
+    issue_tokens = set(signals.tokens)
+    behavior_tokens = set(signals.behavior_terms)
+    quoted_terms = [term.lower() for term in [*signals.quoted_terms, *signals.error_messages] if len(term) >= 3]
+    for path, entry in sorted(entries.items()):
+        role = entry.get("role", context_file_role_for_path(repo, path))
+        path_tokens = set(entry.get("path_tokens", []))
+        content_tokens = set(entry.get("content_tokens", []))
+        path_overlap = issue_tokens & path_tokens
+        content_overlap = behavior_tokens & content_tokens
+        if path_overlap:
+            add_candidate_score(candidates, repo, path, min(180, 45 * len(path_overlap)), kind="path_term", value=",".join(sorted(path_overlap)[:8]), role=role)
+        if content_overlap:
+            add_candidate_score(candidates, repo, path, min(180, 18 * len(content_overlap)), kind="behavior_term", value=",".join(sorted(content_overlap)[:8]), role=role)
+        if signals.test_names and role == "test":
+            test_names = set(test_index.get("test_names_by_path", {}).get(path, []))
+            matches = sorted(set(signals.test_names) & test_names)
+            if matches:
+                add_candidate_score(candidates, repo, path, 520, kind="test_name", value=",".join(matches), role=role)
+        if quoted_terms:
+            text: str | None = None
+            indexed_tokens = path_tokens | content_tokens
+            index_covers_exact_prefilter = int(entry.get("size", 0) or 0) <= 200_000
+            for term in quoted_terms[:8]:
+                term_tokens = set(context_signal_tokens(term))
+                if index_covers_exact_prefilter and term_tokens and not term_tokens <= indexed_tokens:
+                    continue
+                if text is None:
+                    text = safe_read(repo / path, limit=500_000).lower()
+                if term and term in text:
+                    kind = "error_message" if term in {item.lower() for item in signals.error_messages} else "quoted_string"
+                    add_candidate_score(candidates, repo, path, 260, kind=kind, value=term[:120], role=role)
+                    break
+
+    for module in modules:
+        score = module_target_score(module, " ".join([*signals.tokens, *signals.symbols, *signals.path_hints]))
+        if score <= 0:
+            continue
+        for path in [*module.source_files, *module.test_files]:
+            if path in entries:
+                add_candidate_score(candidates, repo, path, min(90, score), kind="module_prior", value=module.name, role=entries[path]["role"])
+
+    source_to_tests: dict[str, list[str]] = test_index.get("source_to_tests", {})
+    test_to_sources: dict[str, list[str]] = test_index.get("test_to_sources", {})
+    paired_paths: list[tuple[str, str, str]] = []
+    for path in list(candidates):
+        for test_path in source_to_tests.get(path, [])[:3]:
+            paired_paths.append((test_path, "test_pair", path))
+        for source_path in test_to_sources.get(path, [])[:3]:
+            paired_paths.append((source_path, "test_pair", path))
+    for path, kind, value in paired_paths:
+        add_candidate_score(candidates, repo, path, 140, kind=kind, value=value)
+
+    for candidate in candidates.values():
+        direct = direct_path_evidence_for(candidate["path"], signals)
+        penalty = 0
+        flags = set(candidate.get("risk_flags", []))
+        if not direct:
+            if flags & {"vendor_generated_static", "generated", "generated_or_minified"}:
+                penalty += 460
+            if "docs" in flags:
+                penalty += 160
+            if "config" in flags:
+                penalty += 120
+        try:
+            size = (repo / candidate["path"]).stat().st_size
+        except OSError:
+            size = 0
+        if size > 250_000 and not direct:
+            penalty += 80
+            candidate["risk_flags"] = context_unique([*candidate.get("risk_flags", []), "large_file"])
+        if penalty:
+            candidate["score"] -= penalty
+            candidate["evidence"].append({"kind": "risk_penalty", "value": ",".join(sorted(flags)) or "large_file", "weight": -penalty})
+        candidate["score"] = max(0, int(candidate["score"]))
+        candidate["confidence"] = candidate_confidence(candidate)
+        module = module_for_context_path(modules, candidate["path"])
+        candidate["module"] = module.name if module else None
+
+    ranked = [
+        candidate
+        for candidate in candidates.values()
+        if candidate["score"] > 0
+    ]
+    ranked.sort(key=lambda item: (-int(item["score"]), item["path"]))
+    return ranked[:max_candidate_files]
+
+
+def centered_line_window(line: int, total_lines: int, line_window: int) -> tuple[int, int]:
+    half = max(0, line_window // 2)
+    start = max(1, line - half)
+    end = min(total_lines, start + line_window - 1)
+    start = max(1, end - line_window + 1)
+    return start, end
+
+
+def term_line_hits(lines: list[str], terms: list[str]) -> list[tuple[int, str]]:
+    hits: list[tuple[int, str]] = []
+    lowered_terms = [term.lower() for term in terms if len(term) >= 3]
+    for index, line in enumerate(lines, start=1):
+        lowered = line.lower()
+        for term in lowered_terms:
+            if term in lowered:
+                hits.append((index, term))
+                break
+    return hits
+
+
+def rank_line_windows(
+    repo: Path,
+    signals: IssueSignals,
+    file_candidates: list[dict[str, Any]],
+    symbol_index: dict[str, Any],
+    *,
+    max_regions: int = 12,
+    line_window: int = 80,
+) -> list[dict[str, Any]]:
+    regions: list[dict[str, Any]] = []
+    symbol_terms = set(signals.symbols)
+    symbol_terms.update(name.rsplit(".", 1)[-1] for name in signals.dotted_names)
+    direct_terms = [*signals.quoted_terms, *signals.error_messages, *signals.test_names]
+    behavior_terms = signals.behavior_terms
+
+    for candidate in file_candidates:
+        path = candidate["path"]
+        text = safe_read(repo / path, limit=2_000_000)
+        if not text:
+            continue
+        lines = text.splitlines()
+        if not lines:
+            continue
+        total_lines = len(lines)
+        windows: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        if any(item.get("kind") == "exact_path" for item in candidate.get("evidence", [])):
+            windows.setdefault((1, min(total_lines, line_window)), []).append(
+                {"kind": "exact_path", "value": path, "line": 1, "weight": 260}
+            )
+
+        for hint, trace_lines in signals.traceback_lines.items():
+            if not path_hint_matches(path, hint):
+                continue
+            for line in trace_lines:
+                start, end = centered_line_window(line, total_lines, line_window)
+                windows.setdefault((start, end), []).append({"kind": "traceback", "value": hint, "line": line, "weight": 450})
+
+        for record in symbol_index.get("by_path", {}).get(path, []):
+            if record.get("name") in symbol_terms or set(record.get("tokens", [])) & set(signals.tokens):
+                start = max(1, int(record.get("start", 1)))
+                end = min(total_lines, max(start, int(record.get("end", start))))
+                if end - start + 1 > line_window:
+                    end = min(total_lines, start + line_window - 1)
+                windows.setdefault((start, end), []).append({"kind": "symbol", "value": record.get("name", ""), "line": start, "weight": 320})
+
+        for line, term in term_line_hits(lines, direct_terms):
+            start, end = centered_line_window(line, total_lines, line_window)
+            kind = "test_name" if term in {name.lower() for name in signals.test_names} else "quoted_string"
+            windows.setdefault((start, end), []).append({"kind": kind, "value": term, "line": line, "weight": 220})
+
+        if not windows:
+            issue_tokens = set(signals.tokens)
+            best_window: tuple[int, int] | None = None
+            best_hits: list[str] = []
+            step = max(1, line_window // 2)
+            for start in range(1, total_lines + 1, step):
+                end = min(total_lines, start + line_window - 1)
+                window_tokens = set(context_signal_tokens("\n".join(lines[start - 1 : end])))
+                hits = sorted((issue_tokens & window_tokens) - CONTEXT_TARGET_STOP_WORDS)
+                if len(hits) > len(best_hits):
+                    best_window = (start, end)
+                    best_hits = hits
+                if end == total_lines:
+                    break
+            if best_window and best_hits:
+                windows.setdefault(best_window, []).append({"kind": "term_density", "value": ",".join(best_hits[:8]), "weight": min(140, 18 * len(best_hits))})
+
+        if not windows:
+            windows[(1, min(total_lines, line_window))] = [{"kind": "fallback", "value": "top candidate file", "weight": 10}]
+
+        for (start, end), evidence in windows.items():
+            snippet_text = "\n".join(lines[start - 1 : end])
+            window_tokens = set(context_signal_tokens(snippet_text))
+            behavior_hits = sorted(set(behavior_terms) & window_tokens)
+            if behavior_hits:
+                evidence = [*evidence, {"kind": "behavior_term", "value": ",".join(behavior_hits[:8]), "weight": min(120, 12 * len(behavior_hits))}]
+            window_score = sum(int(item.get("weight", 0)) for item in evidence)
+            total_score = int(candidate["score"] * 0.35) + window_score
+            regions.append(
+                {
+                    "path": path,
+                    "start": start,
+                    "end": end,
+                    "score": total_score,
+                    "file_score": int(candidate["score"]),
+                    "window_score": window_score,
+                    "role": candidate["role"],
+                    "evidence": evidence,
+                    "strength": evidence_strength(evidence, window_score),
+                    "candidate_confidence": candidate.get("confidence", "weak"),
+                }
+            )
+
+    regions.sort(key=lambda item: (-int(item["score"]), item["path"], int(item["start"]), int(item["end"])))
+    selected: list[dict[str, Any]] = []
+    for region in regions:
+        redundant = False
+        for existing in selected:
+            if existing["path"] != region["path"]:
+                continue
+            overlap = max(0, min(int(region["end"]), int(existing["end"])) - max(int(region["start"]), int(existing["start"])) + 1)
+            length = int(region["end"]) - int(region["start"]) + 1
+            if overlap / max(1, length) >= 0.75:
+                redundant = True
+                break
+        if redundant:
+            continue
+        selected.append(region)
+        if len(selected) >= max_regions:
+            break
+    return selected
+
+
+def baseline_retrieve_context(
+    repo: Path,
+    task_text: str,
+    *,
+    search_index: dict[str, Any] | None = None,
+    max_files: int = 12,
+) -> dict[str, Any]:
+    search_index = search_index or build_repo_search_index(repo)
+    signals = extract_issue_signals(task_text)
+    query_tokens = set(signals.tokens)
+    candidates: list[dict[str, Any]] = []
+    for path, entry in search_index.get("entries", {}).items():
+        path_hits = query_tokens & set(entry.get("path_tokens", []))
+        content_hits = query_tokens & set(entry.get("content_tokens", []))
+        score = 30 * len(path_hits) + 8 * len(content_hits)
+        if score <= 0:
+            continue
+        candidates.append(
+            {
+                "path": path,
+                "role": entry.get("role"),
+                "score": score,
+                "evidence": [
+                    *([{"kind": "path_term", "value": ",".join(sorted(path_hits)[:8])}] if path_hits else []),
+                    *([{"kind": "content_term", "value": ",".join(sorted(content_hits)[:8])}] if content_hits else []),
+                ],
+            }
+        )
+    candidates.sort(key=lambda item: (-int(item["score"]), item["path"]))
+    return {
+        "strategy": "baseline_lexical",
+        "fingerprint": search_index.get("fingerprint"),
+        "candidates": candidates[:max_files],
+    }
+
+
+def estimate_noise_ratio(files_or_regions: list[dict[str, Any]]) -> dict[str, Any]:
+    if not files_or_regions:
+        return {"ratio": 0.0, "noisy_count": 0, "total": 0, "noisy_paths": []}
+    noisy_paths: list[str] = []
+    for item in files_or_regions:
+        path = str(item.get("path", ""))
+        role = item.get("role") if isinstance(item.get("role"), str) else None
+        flags = item.get("risk_flags")
+        if not isinstance(flags, list):
+            flags = context_path_risk_flags(path, role)
+        if flags:
+            noisy_paths.append(path)
+    return {
+        "ratio": round(len(noisy_paths) / len(files_or_regions), 6),
+        "noisy_count": len(noisy_paths),
+        "total": len(files_or_regions),
+        "noisy_paths": sorted(set(noisy_paths)),
+    }
+
+
+def estimate_candidate_bytes(repo: Path, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    selected_bytes = 0
+    unreadable: list[str] = []
+    for candidate in candidates:
+        path = str(candidate.get("path", ""))
+        try:
+            selected_bytes += (repo / path).stat().st_size
+        except OSError:
+            unreadable.append(path)
+    return {"selected_bytes": selected_bytes, "unreadable_paths": unreadable}
+
+
+def localization_confidence(file_candidates: list[dict[str, Any]], regions: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    if not file_candidates:
+        return "low", ["no_candidate_files"]
+    top = file_candidates[0]
+    direct_kinds = {item.get("kind") for item in top.get("evidence", [])} & DIRECT_LOCALIZATION_EVIDENCE
+    strong_regions = [region for region in regions if region.get("strength") == "strong"]
+    if direct_kinds and (int(top.get("score", 0)) >= 700 or strong_regions):
+        return "high", []
+    if direct_kinds or strong_regions or int(top.get("score", 0)) >= 350:
+        return "medium", []
+    reasons = ["no_direct_issue_evidence"]
+    if estimate_noise_ratio(file_candidates[:5])["ratio"] >= 0.6:
+        reasons.append("mostly_noisy_candidates")
+    return "low", reasons
+
+
+def localization_fingerprint(
+    task_text: str,
+    search_index: dict[str, Any],
+    symbol_index: dict[str, Any],
+    test_index: dict[str, Any],
+    limits: dict[str, Any],
+    model_profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "algorithm": CONTEXT_LOCALIZATION_ALGORITHM,
+        "task_hash": hashlib.sha256(task_text.encode("utf-8")).hexdigest(),
+        "search": search_index.get("fingerprint"),
+        "symbol": symbol_index.get("fingerprint"),
+        "test": test_index.get("fingerprint"),
+        "limits": limits,
+        "model_profile": model_profile or {},
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return {"algorithm": CONTEXT_LOCALIZATION_ALGORITHM, "digest": digest, "inputs": payload}
+
+
+def localize_issue_context(
+    repo: Path,
+    task_text: str,
+    *,
+    max_candidate_files: int = 24,
+    max_regions: int = 12,
+    line_window: int = 80,
+    max_bytes: int = 700_000,
+    model_profile: dict[str, Any] | None = None,
+    include_internal_indexes: bool = False,
+) -> dict[str, Any]:
+    if max_candidate_files < 1:
+        raise ValueError("max_candidate_files must be >= 1")
+    if max_regions < 1:
+        raise ValueError("max_regions must be >= 1")
+    if line_window < 1:
+        raise ValueError("line_window must be >= 1")
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be >= 1")
+    repo = repo.resolve()
+    files = inventory(repo)
+    map_data = build_module_map(repo, files=files)
+    modules = modules_from_map(map_data)
+    signals = extract_issue_signals(task_text)
+    indexes, cache_freshness = build_context_localization_indexes(repo, files)
+    search_index = indexes["search_index"]
+    symbol_index = indexes["symbol_index"]
+    test_index = indexes["test_index"]
+    limits = {
+        "max_candidate_files": max_candidate_files,
+        "max_regions": max_regions,
+        "line_window": line_window,
+        "max_bytes": max_bytes,
+    }
+    file_candidates = rank_context_files(
+        repo,
+        signals,
+        modules,
+        search_index,
+        symbol_index,
+        test_index,
+        max_candidate_files=max_candidate_files,
+    )
+    regions = rank_line_windows(
+        repo,
+        signals,
+        file_candidates,
+        symbol_index,
+        max_regions=max_regions,
+        line_window=line_window,
+    )
+    confidence, abstain_reasons = localization_confidence(file_candidates, regions)
+    module_scores: dict[str, dict[str, Any]] = {}
+    for candidate in file_candidates:
+        module_name = candidate.get("module") or "unmapped"
+        entry = module_scores.setdefault(module_name, {"name": module_name, "score": 0, "evidence": []})
+        entry["score"] += int(candidate.get("score", 0))
+        evidence_kinds = sorted({item.get("kind", "") for item in candidate.get("evidence", []) if item.get("kind")})
+        entry["evidence"].extend(evidence_kinds[:4])
+    module_candidates = sorted(module_scores.values(), key=lambda item: (-int(item["score"]), item["name"]))[:8]
+    for module in module_candidates:
+        module["evidence"] = context_unique(module.get("evidence", []))
+    result = {
+        "product": PRODUCT,
+        "schema_version": "agent-contracts-issue-localization-v1",
+        "repo_root": repo.as_posix(),
+        "task": task_text,
+        "intent": signals.intent,
+        "signals": signals.to_dict(),
+        "module_candidates": module_candidates,
+        "file_candidates": file_candidates,
+        "regions": regions,
+        "confidence": confidence,
+        "abstain_reasons": abstain_reasons,
+        "limits": limits,
+        "index_fingerprints": {
+            "module_map": map_data.get("fingerprint"),
+            "search_index": search_index.get("fingerprint"),
+            "symbol_index": symbol_index.get("fingerprint"),
+            "test_index": test_index.get("fingerprint"),
+            "localization": localization_fingerprint(task_text, search_index, symbol_index, test_index, limits, model_profile),
+        },
+        "cache": {
+            "freshness": {
+                "module_map": "fresh_or_recomputed",
+                "search_index": cache_freshness["search_index"],
+                "symbol_index": cache_freshness["symbol_index"],
+                "test_index": cache_freshness["test_index"],
+                "localization": "fresh",
+            },
+            "stale_policy": "recompute_or_downgrade_gate_confidence",
+        },
+    }
+    if include_internal_indexes:
+        result["_module_map"] = map_data
+        result["_search_index"] = search_index
+        result["_symbol_index"] = symbol_index
+        result["_test_index"] = test_index
+    return result
+
+
+def model_profile_payload(model_profile: str | dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(model_profile, dict):
+        name = str(model_profile.get("name", "unknown")).lower()
+        payload = dict(model_profile)
+        payload["name"] = name
+        return payload
+    name = str(model_profile or "unknown").lower()
+    defaults = {
+        "spark": {"context_budget": 80_000, "anchoring_sensitivity": "high"},
+        "mini": {"context_budget": 128_000, "anchoring_sensitivity": "medium"},
+        "frontier": {"context_budget": 256_000, "anchoring_sensitivity": "low"},
+        "unknown": {"context_budget": 120_000, "anchoring_sensitivity": "unknown"},
+    }
+    return {"name": name, **defaults.get(name, defaults["unknown"])}
+
+
+def evaluate_context_quality(
+    localization: dict[str, Any],
+    baseline_retrieval: dict[str, Any] | None = None,
+    estimate: dict[str, Any] | None = None,
+    model_profile: str | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    profile = model_profile_payload(model_profile)
+    candidates = list(localization.get("file_candidates", []))
+    regions = list(localization.get("regions", []))
+    confidence = str(localization.get("confidence", "low"))
+    direct_count = sum(
+        1
+        for candidate in candidates[:5]
+        if {item.get("kind") for item in candidate.get("evidence", [])} & DIRECT_LOCALIZATION_EVIDENCE
+    )
+    top_score = int(candidates[0].get("score", 0)) if candidates else 0
+    second_score = int(candidates[1].get("score", 0)) if len(candidates) > 1 else 0
+    top_margin = round((top_score - second_score) / top_score, 6) if top_score > 0 else 0.0
+    baseline_paths = {item.get("path") for item in (baseline_retrieval or {}).get("candidates", [])[:8]}
+    local_paths = {item.get("path") for item in candidates[:8]}
+    agreement_paths = sorted(path for path in (baseline_paths & local_paths) if path)
+    agreement = bool(agreement_paths)
+    noise = estimate_noise_ratio(candidates[: max(1, min(8, len(candidates)))])
+    roles = {candidate.get("role") for candidate in candidates[:8]}
+    source_test_coverage = "source" in roles and "test" in roles
+    selected_bytes = int((estimate or {}).get("selected_bytes", 0) or 0)
+    max_bytes = int(localization.get("limits", {}).get("max_bytes", 700_000) or 700_000)
+    budget_risk = selected_bytes > max_bytes if selected_bytes else False
+    top_evidence_kinds = {item.get("kind") for item in candidates[0].get("evidence", [])} if candidates else set()
+    direct_top_path_evidence = bool(top_evidence_kinds & {"exact_path", "traceback"})
+    acceptable_noise = noise["ratio"] <= 0.25 or (direct_top_path_evidence and direct_count > 0)
+    broad_only = (
+        direct_count == 0
+        and not any(region.get("strength") == "strong" for region in regions[:4])
+        and top_evidence_kinds <= {"module_prior", "path_term", "behavior_term", "test_pair", "risk_penalty"}
+    )
+
+    reasons: list[str] = []
+    if not candidates:
+        return {
+            "decision": "abstain",
+            "confidence": "low",
+            "reasons": ["no localized candidate files"],
+            "fallback": "baseline_search",
+            "limits": {"max_preloaded_regions": 0, "max_preloaded_chars": 0},
+            "metrics": {"top_margin": 0.0, "agreement_paths": [], "noise_ratio": noise["ratio"], "direct_evidence_count": 0},
+            "model_profile": profile,
+        }
+    if direct_count:
+        reasons.append("direct issue evidence present")
+    if agreement:
+        reasons.append("baseline retrieval agrees with localizer")
+    if top_margin >= 0.2:
+        reasons.append("top candidate margin is strong")
+    if source_test_coverage:
+        reasons.append("source/test coverage present")
+    if noise["ratio"] <= 0.25:
+        reasons.append("noise ratio below threshold")
+    if budget_risk:
+        reasons.append("selected context risks budget pressure")
+    if acceptable_noise and noise["ratio"] > 0.25:
+        reasons.append("direct path evidence overrides noisy candidate ratio")
+
+    strict = profile.get("name") == "spark" or profile.get("anchoring_sensitivity") == "high"
+    decision = "tool_only"
+    gate_confidence = "low"
+    fallback = "progressive_tools"
+    if confidence == "high" and direct_count and acceptable_noise and not budget_risk:
+        if strict and (direct_count < 2 or top_margin < 0.18) and not agreement:
+            decision = "advisory"
+            gate_confidence = "medium"
+        else:
+            decision = "inject"
+            gate_confidence = "high"
+            fallback = "none"
+    elif broad_only:
+        decision = "tool_only"
+        gate_confidence = "low"
+    elif confidence in {"high", "medium"} and direct_count and noise["ratio"] <= 0.5 and not budget_risk:
+        decision = "advisory"
+        gate_confidence = "medium"
+    elif confidence == "low" and not direct_count and (noise["ratio"] >= 0.5 or not regions):
+        decision = "abstain"
+        fallback = "baseline_search"
+    else:
+        decision = "tool_only"
+
+    if strict and decision == "inject" and len(regions) > 4:
+        reasons.append("spark profile limits preloaded evidence")
+    max_regions = {"inject": 6, "advisory": 4, "tool_only": 0, "abstain": 0}[decision]
+    if strict:
+        max_regions = min(max_regions, 3 if decision == "inject" else 2 if decision == "advisory" else 0)
+    return {
+        "decision": decision,
+        "confidence": gate_confidence,
+        "reasons": context_unique(reasons) or ["localized evidence did not clear direct-evidence thresholds"],
+        "fallback": fallback,
+        "limits": {
+            "max_preloaded_regions": max_regions,
+            "max_preloaded_chars": 12_000 if strict else 24_000,
+        },
+        "metrics": {
+            "top_margin": top_margin,
+            "agreement_paths": agreement_paths,
+            "noise_ratio": noise["ratio"],
+            "direct_evidence_count": direct_count,
+            "source_test_coverage": source_test_coverage,
+            "budget_risk": budget_risk,
+        },
+        "model_profile": profile,
+    }
+
+
+def estimate_anchoring_risk(pack_or_localization: dict[str, Any], model_profile: str | dict[str, Any] | None = None) -> dict[str, Any]:
+    profile = model_profile_payload(model_profile)
+    evidence = pack_or_localization.get("evidence") or pack_or_localization.get("regions") or []
+    weak_count = sum(1 for item in evidence if item.get("strength") == "weak")
+    decision = pack_or_localization.get("gate", {}).get("decision") or pack_or_localization.get("decision")
+    risk_score = weak_count * 2 + max(0, len(evidence) - 6)
+    if profile.get("anchoring_sensitivity") == "high":
+        risk_score += 2
+    if decision in {"tool_only", "abstain"}:
+        risk_score = max(0, risk_score - 3)
+    level = "low" if risk_score <= 1 else "medium" if risk_score <= 4 else "high"
+    return {"level": level, "score": risk_score, "weak_evidence_count": weak_count, "model_profile": profile}
+
+
+def context_intent_payload(task_text: str) -> dict[str, Any]:
+    signals = extract_issue_signals(task_text)
+    next_tools_by_intent = {
+        "bugfix": ["context_localize", "context_read_region", "context_expand", "context_gate", "context_pack_v2"],
+        "test": ["context_localize", "context_read_region", "context_expand", "context_pack_v2"],
+        "docs": ["context_discover", "context_localize", "context_read_region"],
+        "qna": ["context_discover", "context_read", "context_explain"],
+        "review": ["context_intent", "context_localize", "context_gate", "context_explain"],
+        "refactor": ["context_localize", "context_expand", "context_gate", "context_pack_v2"],
+        "unknown": ["context_discover", "context_localize", "context_explain"],
+    }
+    recommended = [
+        {"name": name, "why": reason}
+        for name, reason in {
+            "context_localize": "find issue-specific files and regions",
+            "context_read_region": "inspect bounded source or test windows",
+            "context_expand": "find related tests, callers, and dependency neighbors",
+            "context_gate": "check whether preloading context is safe",
+            "context_pack_v2": "build a gated evidence pack",
+            "context_discover": "inspect the compact module catalog",
+            "context_read": "read contract or module sections before broad source",
+            "context_explain": "audit why evidence was included or omitted",
+            "context_intent": "reclassify task route if the prompt changes",
+        }.items()
+        if name in next_tools_by_intent.get(signals.intent, [])
+    ]
+    return {
+        "product": PRODUCT,
+        "intent": signals.intent,
+        "confidence": "medium" if signals.intent != "unknown" else "low",
+        "signals": signals.to_dict(),
+        "recommended_tools": recommended,
+        "avoid_tools_initially": [
+            {"name": "whole_repo_read", "why": "too broad before issue localization"},
+            {"name": "context_pack", "why": "legacy module pack can be broader than issue evidence"},
+        ],
+    }
+
+
+def read_region_content(repo: Path, path: str, start: int, end: int, *, context_lines: int = 0) -> dict[str, Any]:
+    if start < 1 or end < 1:
+        raise ValueError("start and end must be >= 1")
+    if end < start:
+        raise ValueError("end must be greater than or equal to start")
+    if context_lines < 0:
+        raise ValueError("context_lines must be >= 0")
+    normalized = normalize_context_path(path)
+    if not normalized or normalized.startswith("../") or Path(normalized).is_absolute():
+        raise ValueError(f"invalid repository-relative path: {path}")
+    file_path = (repo / normalized).resolve()
+    try:
+        file_path.relative_to(repo.resolve())
+    except ValueError:
+        raise ValueError(f"path escapes repository: {path}") from None
+    if not file_path.is_file():
+        raise ValueError(f"file not found: {normalized}")
+    text = safe_read(file_path, limit=2_000_000)
+    lines = text.splitlines()
+    if not lines:
+        return {"path": normalized, "start": 1, "end": 0, "content": "", "symbols": [], "nearby_tests": []}
+    bounded_start = max(1, min(int(start), len(lines)))
+    bounded_end = max(bounded_start, min(int(end), len(lines)))
+    if context_lines:
+        bounded_start = max(1, bounded_start - context_lines)
+        bounded_end = min(len(lines), bounded_end + context_lines)
+    selected = lines[bounded_start - 1 : bounded_end]
+    return {
+        "product": PRODUCT,
+        "path": normalized,
+        "start": bounded_start,
+        "end": bounded_end,
+        "content": "\n".join(f"{bounded_start + index}: {line}" for index, line in enumerate(selected)),
+    }
+
+
+def read_region_payload(repo: Path, path: str, start: int, end: int, *, context_lines: int = 0) -> dict[str, Any]:
+    payload = read_region_content(repo, path, start, end, context_lines=context_lines)
+    files = inventory(repo)
+    indexes, _freshness = build_context_localization_indexes(repo, files, include=("symbol_index", "test_index"))
+    symbol_index = indexes["symbol_index"]
+    test_index = indexes["test_index"]
+    symbols = [
+        record
+        for record in symbol_index.get("by_path", {}).get(payload["path"], [])
+        if int(record.get("start", 0)) <= int(payload["end"]) and int(record.get("end", 0)) >= int(payload["start"])
+    ]
+    payload["symbols"] = symbols
+    payload["nearby_tests"] = test_index.get("source_to_tests", {}).get(payload["path"], [])
+    return payload
+
+
+def context_expand_payload(repo: Path, path: str, *, start: int | None = None, end: int | None = None, reason: str = "") -> dict[str, Any]:
+    normalized = normalize_context_path(path)
+    files = inventory(repo)
+    map_data = build_module_map(repo, files=files)
+    modules = modules_from_map(map_data)
+    indexes, _freshness = build_context_localization_indexes(repo, files, include=("test_index",))
+    test_index = indexes["test_index"]
+    module = module_for_context_path(modules, normalized)
+    neighbors: list[dict[str, Any]] = []
+    for test_path in test_index.get("source_to_tests", {}).get(normalized, []):
+        neighbors.append({"path": test_path, "relationship": "test", "why": "paired by test/source index"})
+    for source_path in test_index.get("test_to_sources", {}).get(normalized, []):
+        neighbors.append({"path": source_path, "relationship": "source_under_test", "why": "paired by test/source index"})
+    if module:
+        for import_ref in module.imports:
+            if import_ref.source == normalized and import_ref.resolved_path:
+                neighbors.append({"path": import_ref.resolved_path, "relationship": "dependency", "why": f"imported by {normalized}"})
+            if import_ref.resolved_path == normalized:
+                neighbors.append({"path": import_ref.source, "relationship": "caller_or_importer", "why": f"imports {normalized}"})
+        for candidate in [*module.source_files[:5], *module.test_files[:5]]:
+            if candidate != normalized:
+                neighbors.append({"path": candidate, "relationship": "same_module", "why": f"same module: {module.name}"})
+    deduped: dict[str, dict[str, Any]] = {}
+    for item in neighbors:
+        deduped.setdefault(item["path"], item)
+    return {
+        "product": PRODUCT,
+        "path": normalized,
+        "region": {"start": start, "end": end} if start is not None and end is not None else None,
+        "reason": reason,
+        "module": module.to_dict() if module else None,
+        "neighbors": [deduped[path] for path in sorted(deduped)],
+    }
+
+
+def evidence_snippet(repo: Path, region: dict[str, Any], *, max_chars: int) -> str:
+    payload = read_region_content(repo, str(region["path"]), int(region["start"]), int(region["end"]))
+    content = payload.get("content", "")
+    if len(content) <= max_chars:
+        return content
+    return content[:max_chars].rstrip() + "\n...[truncated]"
+
+
+def verification_for_pack(modules: list[ModuleInfo], file_candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    test_paths = [candidate["path"] for candidate in file_candidates if candidate.get("role") == "test"]
+    module_names = context_unique([candidate.get("module", "") for candidate in file_candidates if candidate.get("module")])
+    module_by_name = {module.name: module for module in modules}
+    commands: list[str] = []
+    for name in module_names:
+        module = module_by_name.get(name)
+        if module:
+            commands.extend(module.commands)
+    for test_path in test_paths[:4]:
+        if Path(test_path).suffix == ".py":
+            commands.append(f"python -m pytest {shlex.quote(test_path)}")
+        elif Path(test_path).suffix in {".js", ".jsx", ".ts", ".tsx"}:
+            commands.append(f"npm test -- {shlex.quote(test_path)}")
+    return {"tests": test_paths[:8], "commands": context_unique(commands)[:8]}
+
+
+def build_context_pack_v2(
+    repo: Path,
+    task_text: str,
+    output: Path | None = None,
+    *,
+    max_regions: int = 8,
+    max_bytes: int = 700_000,
+    line_window: int = 80,
+    model_profile: str | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if max_regions < 1:
+        raise ValueError("max_regions must be >= 1")
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be >= 1")
+    if line_window < 1:
+        raise ValueError("line_window must be >= 1")
+    profile = model_profile_payload(model_profile)
+    localization = localize_issue_context(
+        repo,
+        task_text,
+        max_candidate_files=max(24, max_regions * 3),
+        max_regions=max(12, max_regions * 2),
+        line_window=line_window,
+        max_bytes=max_bytes,
+        model_profile=profile,
+        include_internal_indexes=True,
+    )
+    baseline = baseline_retrieve_context(repo, task_text, search_index=localization.get("_search_index"), max_files=12)
+    gate = evaluate_context_quality(
+        localization,
+        baseline,
+        estimate=estimate_candidate_bytes(repo, localization.get("file_candidates", [])[:max_regions]),
+        model_profile=profile,
+    )
+    map_data = localization.get("_module_map") or build_module_map(repo)
+    modules = modules_from_map(map_data)
+    preload_limit = min(max_regions, int(gate["limits"]["max_preloaded_regions"]))
+    char_budget = int(gate["limits"]["max_preloaded_chars"])
+    selected_regions: list[dict[str, Any]] = []
+    omitted: list[dict[str, str]] = []
+    used_chars = 0
+    for region in localization.get("regions", []):
+        if len(selected_regions) >= preload_limit:
+            omitted.append({"path": region["path"], "reason": "gate preloaded-region limit"})
+            continue
+        if profile["name"] == "spark" and region.get("strength") == "weak":
+            omitted.append({"path": region["path"], "reason": "weak evidence omitted for spark profile"})
+            continue
+        snippet = evidence_snippet(repo, region, max_chars=2_400 if profile["name"] == "spark" else 4_000)
+        if used_chars + len(snippet) > char_budget:
+            omitted.append({"path": region["path"], "reason": "gate character budget"})
+            continue
+        selected = {
+            "path": region["path"],
+            "start": region["start"],
+            "end": region["end"],
+            "role": region.get("role"),
+            "strength": region.get("strength", "weak"),
+            "why": [f"{item.get('kind')}:{item.get('value')}" for item in region.get("evidence", [])],
+            "snippet": snippet,
+        }
+        selected_regions.append(selected)
+        used_chars += len(snippet)
+    if gate["decision"] in {"tool_only", "abstain"}:
+        omitted.extend({"path": region["path"], "reason": f"gate decision {gate['decision']} does not preload snippets"} for region in localization.get("regions", [])[:max_regions])
+        selected_regions = []
+
+    safe_to_edit = sorted({item["path"] for item in selected_regions if item.get("role") == "source" and item.get("strength") in {"strong", "medium"}})
+    read_only = sorted({candidate["path"] for candidate in localization.get("file_candidates", []) if set(candidate.get("risk_flags", [])) & {"docs", "config", "vendor_generated_static", "generated", "generated_or_minified"}})
+    avoid = sorted({candidate["path"] for candidate in localization.get("file_candidates", []) if candidate.get("confidence") == "weak"})[:12]
+    verification = verification_for_pack(modules, localization.get("file_candidates", []))
+    advisory_rule = (
+        "The evidence below is advisory. First form an independent hypothesis from the issue and repository. "
+        "Use this pack to accelerate verification, not to replace repository evidence. Ignore weak candidates "
+        "when direct repository evidence disagrees."
+    )
+    hypotheses = [
+        {
+            "id": f"H{index}",
+            "summary": f"{task_text[:120]}",
+            "confidence": item.get("strength", "weak"),
+            "evidence": [f"{item['path']}:{item['start']}-{item['end']}"],
+        }
+        for index, item in enumerate(selected_regions[:3], start=1)
+    ]
+    if not hypotheses:
+        hypotheses = [{"id": "H1", "summary": "No high-confidence localized hypothesis cleared the gate.", "confidence": "low", "evidence": []}]
+    agent_facing_candidates = localization["file_candidates"][:12]
+    agent_facing_regions = [
+        {key: value for key, value in region.items() if key != "snippet"}
+        for region in localization.get("regions", [])[:12]
+    ]
+    audit_only = {
+        "candidate_count": len(localization.get("file_candidates", [])),
+        "region_count": len(localization.get("regions", [])),
+    }
+    if gate["decision"] in {"tool_only", "abstain"}:
+        agent_facing_candidates = []
+        agent_facing_regions = []
+        audit_only["redaction_reason"] = f"gate decision {gate['decision']} does not expose weak localized paths as pack evidence"
+    pack = {
+        "product": PRODUCT,
+        "schema_version": CONTEXT_PACK_V2_SCHEMA_VERSION,
+        "created_at": utc_now(),
+        "task": task_text,
+        "intent": localization["intent"],
+        "model_profile": profile,
+        "gate": gate,
+        "prompt_contract": advisory_rule,
+        "hypotheses": hypotheses,
+        "evidence": selected_regions,
+        "boundaries": {
+            "safe_to_edit": safe_to_edit,
+            "read_only": read_only,
+            "avoid_unless_confirmed": avoid,
+        },
+        "verification": verification,
+        "omissions": omitted[:40],
+        "localization": {
+            "confidence": localization["confidence"],
+            "signals": localization["signals"],
+            "module_candidates": localization["module_candidates"],
+            "file_candidates": agent_facing_candidates,
+            "regions": agent_facing_regions,
+            "audit_only": audit_only,
+            "abstain_reasons": localization["abstain_reasons"],
+            "index_fingerprints": localization["index_fingerprints"],
+        },
+        "anchoring_risk": estimate_anchoring_risk({"evidence": selected_regions, "gate": gate}, profile),
+        "limits": {"max_regions": max_regions, "max_bytes": max_bytes, "line_window": line_window, "used_preloaded_chars": used_chars},
+    }
+    if output is not None:
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "manifest.json").write_text(json.dumps(pack, indent=2) + "\n", encoding="utf-8")
+        readme_lines = [
+            "# Context Pack V2",
+            "",
+            GENERATED_BY,
+            "",
+            advisory_rule,
+            "",
+            f"Gate decision: `{gate['decision']}`",
+            f"Intent: `{localization['intent']}`",
+            "",
+            "## Evidence",
+            *([f"- `{item['path']}:{item['start']}-{item['end']}` ({item['strength']})" for item in selected_regions] if selected_regions else ["- No snippets preloaded."]),
+            "",
+            "## Verification Commands",
+            *([f"- `{command}`" for command in verification["commands"]] if verification["commands"] else ["- No command detected."]),
+        ]
+        (output / "README.md").write_text("\n".join(readme_lines) + "\n", encoding="utf-8")
+        pack["pack_path"] = output.as_posix()
+        pack["manifest_path"] = (output / "manifest.json").as_posix()
+    return pack
+
+
+def context_gate_payload(repo: Path, task_text: str, *, model_profile: str | dict[str, Any] | None = None, max_bytes: int = 700_000) -> dict[str, Any]:
+    localization = localize_issue_context(
+        repo,
+        task_text,
+        max_bytes=max_bytes,
+        model_profile=model_profile_payload(model_profile),
+        include_internal_indexes=True,
+    )
+    baseline = baseline_retrieve_context(repo, task_text, search_index=localization.get("_search_index"))
+    gate = evaluate_context_quality(
+        localization,
+        baseline,
+        estimate=estimate_candidate_bytes(repo, localization.get("file_candidates", [])[:12]),
+        model_profile=model_profile,
+    )
+    return {"product": PRODUCT, "task": task_text, "localization_confidence": localization["confidence"], "gate": gate, "baseline": baseline}
+
+
+def context_explain_payload(repo: Path, task_text: str, *, model_profile: str | dict[str, Any] | None = None) -> dict[str, Any]:
+    pack = build_context_pack_v2(repo, task_text, model_profile=model_profile)
+    return {
+        "product": PRODUCT,
+        "task": task_text,
+        "intent": pack["intent"],
+        "gate": pack["gate"],
+        "included": [
+            {"path": item["path"], "start": item["start"], "end": item["end"], "strength": item["strength"], "why": item["why"]}
+            for item in pack.get("evidence", [])
+        ],
+        "omissions": pack.get("omissions", []),
+        "boundaries": pack.get("boundaries", {}),
+        "anchoring_risk": pack.get("anchoring_risk", {}),
+    }
 
 
 def module_target_score(module: ModuleInfo, target: str) -> int:
@@ -5028,6 +6659,104 @@ def render_context_benchmark_text(report: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def positive_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
+
+
+def nonnegative_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
+def print_payload(payload: dict[str, Any], output_format: str) -> None:
+    del output_format
+    print(json.dumps(payload, indent=2))
+
+
+def cmd_context_intent(args: argparse.Namespace) -> int:
+    print_payload(context_intent_payload(args.task), args.format)
+    return 0
+
+
+def cmd_context_localize(args: argparse.Namespace) -> int:
+    repo = Path(args.repo).resolve()
+    payload = localize_issue_context(
+        repo,
+        args.task,
+        max_candidate_files=args.max_candidate_files,
+        max_regions=args.max_regions,
+        line_window=args.line_window,
+        max_bytes=args.max_bytes,
+        model_profile=model_profile_payload(args.model_profile),
+    )
+    print_payload(payload, args.format)
+    return 0
+
+
+def cmd_context_read_region(args: argparse.Namespace) -> int:
+    repo = Path(args.repo).resolve()
+    if args.end < args.start:
+        print("--end must be greater than or equal to --start", file=sys.stderr)
+        return 2
+    payload = read_region_payload(repo, args.path, args.start, args.end, context_lines=args.context_lines)
+    print_payload(payload, args.format)
+    return 0
+
+
+def cmd_context_expand(args: argparse.Namespace) -> int:
+    repo = Path(args.repo).resolve()
+    if (args.start is None) != (args.end is None):
+        print("--start and --end must be provided together", file=sys.stderr)
+        return 2
+    if args.start is not None and args.end < args.start:
+        print("--end must be greater than or equal to --start", file=sys.stderr)
+        return 2
+    payload = context_expand_payload(repo, args.path, start=args.start, end=args.end, reason=args.reason or "")
+    print_payload(payload, args.format)
+    return 0
+
+
+def cmd_context_gate(args: argparse.Namespace) -> int:
+    repo = Path(args.repo).resolve()
+    payload = context_gate_payload(repo, args.task, model_profile=args.model_profile, max_bytes=args.max_bytes)
+    print_payload(payload, args.format)
+    return 0
+
+
+def cmd_context_pack_v2(args: argparse.Namespace) -> int:
+    repo = Path(args.repo).resolve()
+    output = Path(args.output).resolve() if args.output else None
+    payload = build_context_pack_v2(
+        repo,
+        args.task,
+        output,
+        max_regions=args.max_regions,
+        max_bytes=args.max_bytes,
+        line_window=args.line_window,
+        model_profile=args.model_profile,
+    )
+    print_payload(payload, args.format)
+    return 0
+
+
+def cmd_context_explain(args: argparse.Namespace) -> int:
+    repo = Path(args.repo).resolve()
+    payload = context_explain_payload(repo, args.task, model_profile=args.model_profile)
+    print_payload(payload, args.format)
+    return 0
+
+
 def cmd_context_pack(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     output = Path(args.output).resolve() if args.output else None
@@ -5223,6 +6952,66 @@ def build_parser() -> argparse.ArgumentParser:
     read_parser.add_argument("--repo", default=".", help="Repository to inspect")
     read_parser.add_argument("--format", choices=["text", "json"], default="text")
     read_parser.set_defaults(func=cmd_context_read)
+
+    intent_parser = subparsers.add_parser("context-intent", help="Classify a task and recommend context tools")
+    intent_parser.add_argument("task", help="Task, issue, or question text")
+    intent_parser.add_argument("--format", choices=["json"], default="json")
+    intent_parser.set_defaults(func=cmd_context_intent)
+
+    localize_parser = subparsers.add_parser("context-localize", help="Rank issue-specific files and line windows")
+    localize_parser.add_argument("task", help="Task or issue text")
+    localize_parser.add_argument("--repo", default=".", help="Repository to inspect")
+    localize_parser.add_argument("--format", choices=["json"], default="json")
+    localize_parser.add_argument("--max-candidate-files", type=positive_int_arg, default=24)
+    localize_parser.add_argument("--max-regions", type=positive_int_arg, default=12)
+    localize_parser.add_argument("--line-window", type=positive_int_arg, default=80)
+    localize_parser.add_argument("--max-bytes", type=positive_int_arg, default=700_000)
+    localize_parser.add_argument("--model-profile", choices=MODEL_PROFILE_NAMES, default="unknown")
+    localize_parser.set_defaults(func=cmd_context_localize)
+
+    region_parser = subparsers.add_parser("context-read-region", help="Read a bounded repository file window")
+    region_parser.add_argument("path", help="Repository-relative file path")
+    region_parser.add_argument("start", type=positive_int_arg, help="1-based start line")
+    region_parser.add_argument("end", type=positive_int_arg, help="1-based inclusive end line")
+    region_parser.add_argument("--repo", default=".", help="Repository to inspect")
+    region_parser.add_argument("--context-lines", type=nonnegative_int_arg, default=0)
+    region_parser.add_argument("--format", choices=["json"], default="json")
+    region_parser.set_defaults(func=cmd_context_read_region)
+
+    expand_parser = subparsers.add_parser("context-expand", help="Expand from a localized path to related tests and neighbors")
+    expand_parser.add_argument("path", help="Repository-relative file path")
+    expand_parser.add_argument("--repo", default=".", help="Repository to inspect")
+    expand_parser.add_argument("--start", type=positive_int_arg)
+    expand_parser.add_argument("--end", type=positive_int_arg)
+    expand_parser.add_argument("--reason")
+    expand_parser.add_argument("--format", choices=["json"], default="json")
+    expand_parser.set_defaults(func=cmd_context_expand)
+
+    gate_parser = subparsers.add_parser("context-gate", help="Evaluate whether localized context is safe to preload")
+    gate_parser.add_argument("task", help="Task or issue text")
+    gate_parser.add_argument("--repo", default=".", help="Repository to inspect")
+    gate_parser.add_argument("--model-profile", choices=MODEL_PROFILE_NAMES, default="unknown")
+    gate_parser.add_argument("--max-bytes", type=positive_int_arg, default=700_000)
+    gate_parser.add_argument("--format", choices=["json"], default="json")
+    gate_parser.set_defaults(func=cmd_context_gate)
+
+    pack_v2_parser = subparsers.add_parser("context-pack-v2", help="Build an issue-localized gated evidence pack")
+    pack_v2_parser.add_argument("task", help="Task or issue text")
+    pack_v2_parser.add_argument("--repo", default=".", help="Repository to inspect")
+    pack_v2_parser.add_argument("--output", help="Optional output directory for manifest.json and README.md")
+    pack_v2_parser.add_argument("--model-profile", choices=MODEL_PROFILE_NAMES, default="unknown")
+    pack_v2_parser.add_argument("--max-regions", type=positive_int_arg, default=8)
+    pack_v2_parser.add_argument("--line-window", type=positive_int_arg, default=80)
+    pack_v2_parser.add_argument("--max-bytes", type=positive_int_arg, default=700_000)
+    pack_v2_parser.add_argument("--format", choices=["json"], default="json")
+    pack_v2_parser.set_defaults(func=cmd_context_pack_v2)
+
+    explain_parser = subparsers.add_parser("context-explain", help="Explain included and omitted context evidence")
+    explain_parser.add_argument("task", help="Task or issue text")
+    explain_parser.add_argument("--repo", default=".", help="Repository to inspect")
+    explain_parser.add_argument("--model-profile", choices=MODEL_PROFILE_NAMES, default="unknown")
+    explain_parser.add_argument("--format", choices=["json"], default="json")
+    explain_parser.set_defaults(func=cmd_context_explain)
 
     verify_parser = subparsers.add_parser("verify-context", help="Verify deterministic context selection against a JSONL manifest")
     verify_parser.add_argument("manifest", help="Context selection manifest JSONL")

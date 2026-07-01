@@ -28,8 +28,14 @@ except ImportError:  # pragma: no cover - direct script execution path
     import agent_contracts  # type: ignore[no-redef]
 
 
-STATIC_STRATEGIES = ("module", "graph-like", "progressive-mcp", "contract-ranked", "beat-sota1")
-AGENT_STRATEGIES = ("codex-baseline", "codex-agent-contracts", "codex-beat-sota1", "codex-beat-sota2")
+STATIC_STRATEGIES = ("module", "graph-like", "progressive-mcp", "contract-ranked", "context-localized", "beat-sota1")
+AGENT_STRATEGIES = (
+    "codex-baseline",
+    "codex-agent-contracts",
+    "codex-context-localized",
+    "codex-beat-sota1",
+    "codex-beat-sota2",
+)
 STRATEGIES = (*STATIC_STRATEGIES, *AGENT_STRATEGIES)
 DEFAULT_MAX_FILES = 80
 DEFAULT_MAX_BYTES = 700_000
@@ -2065,6 +2071,136 @@ def sanitized_selection_row(issue_text: str) -> dict[str, Any]:
     return {"task": issue_text, "graph_seed_hints": []}
 
 
+def context_candidate_risk_counts(candidates: list[dict[str, Any]]) -> dict[str, int]:
+    noisy_path_count = 0
+    vendored_noisy_path_count = 0
+    generated_or_minified_count = 0
+    docs_or_config_count = 0
+    for candidate in candidates:
+        flags = set(candidate.get("risk_flags", []))
+        if flags:
+            noisy_path_count += 1
+        if "vendor_generated_static" in flags:
+            vendored_noisy_path_count += 1
+        if flags & {"generated", "generated_or_minified"}:
+            generated_or_minified_count += 1
+        if flags & {"docs", "config"}:
+            docs_or_config_count += 1
+    return {
+        "noisy_path_count": noisy_path_count,
+        "vendored_noisy_path_count": vendored_noisy_path_count,
+        "generated_or_minified_count": generated_or_minified_count,
+        "docs_or_config_count": docs_or_config_count,
+    }
+
+
+def context_localized_context_files(
+    repo: Path,
+    issue_text: str,
+    *,
+    max_files: int,
+    max_bytes: int,
+    top_k: int,
+    line_window: int,
+    model_profile: str | dict[str, Any] | None = "unknown",
+) -> dict[str, Any]:
+    profile = agent_contracts.model_profile_payload(model_profile)
+    localization = agent_contracts.localize_issue_context(
+        repo,
+        issue_text,
+        max_candidate_files=max(max_files * 2, max_files + top_k),
+        max_regions=max(top_k * 4, top_k),
+        line_window=line_window,
+        max_bytes=max_bytes,
+        model_profile=profile,
+        include_internal_indexes=True,
+    )
+    baseline = agent_contracts.baseline_retrieve_context(
+        repo,
+        issue_text,
+        search_index=localization.get("_search_index"),
+        max_files=max_files,
+    )
+    gate = agent_contracts.evaluate_context_quality(
+        localization,
+        baseline,
+        estimate=agent_contracts.estimate_candidate_bytes(repo, localization.get("file_candidates", [])[:max_files]),
+        model_profile=profile,
+    )
+    all_candidates = localization.get("file_candidates", [])
+    risk_counts = context_candidate_risk_counts(all_candidates)
+    candidate_context_files = [
+        agent_contracts.ContextFile(candidate["path"], candidate.get("role", "source"))
+        for candidate in all_candidates
+    ]
+    limited_files, limit_omissions, selected_bytes = agent_contracts.apply_context_limits(
+        repo,
+        candidate_context_files,
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+    included_paths = {item.path for item in limited_files}
+    candidates = [candidate for candidate in all_candidates if candidate["path"] in included_paths]
+    bounded_localization = dict(localization)
+    bounded_localization["file_candidates"] = candidates
+    bounded_regions = [
+        region
+        for region in localization.get("regions", [])
+        if region.get("path") in included_paths
+    ]
+    if gate["decision"] in {"tool_only", "abstain"}:
+        bounded_regions = []
+    else:
+        bounded_regions = bounded_regions[: int(gate.get("limits", {}).get("max_preloaded_regions", top_k))]
+    bounded_localization["regions"] = bounded_regions
+    trace = [
+        {
+            "rank": index,
+            "strategy": "context-localized",
+            "operation": "file_rank",
+            "path": candidate["path"],
+            "role": candidate.get("role"),
+            "score": candidate.get("score"),
+            "confidence": candidate.get("confidence"),
+            "evidence": candidate.get("evidence", []),
+            "risk_flags": candidate.get("risk_flags", []),
+        }
+        for index, candidate in enumerate(candidates, start=1)
+    ]
+    trace.extend(
+        {
+            "rank": index,
+            "strategy": "context-localized",
+            "operation": "region_rank",
+            "path": region["path"],
+            "start": region["start"],
+            "end": region["end"],
+            "score": region.get("score"),
+            "file_score": region.get("file_score"),
+            "window_score": region.get("window_score"),
+            "strength": region.get("strength"),
+            "evidence": region.get("evidence", []),
+        }
+        for index, region in enumerate(bounded_regions, start=1)
+    )
+    return {
+        "files": [agent_contracts.ContextFile(candidate["path"], candidate.get("role", "source")) for candidate in candidates],
+        "included_files": [candidate["path"] for candidate in candidates],
+        "omitted_files": limit_omissions,
+        "selected_bytes": selected_bytes,
+        "resolved_module": localization.get("module_candidates", [{}])[0].get("name") if localization.get("module_candidates") else None,
+        "trace": trace,
+        "context_localized": {
+            "model_profile": profile,
+            "localization": bounded_localization,
+            "gate": gate,
+            "baseline": baseline,
+            "all_candidate_count": len(all_candidates),
+            "risk_counts": risk_counts,
+        },
+    }
+
+
 def select_context(
     repo: Path,
     issue_text: str,
@@ -2078,7 +2214,18 @@ def select_context(
     beat_sota1_regions_per_file: int,
     beat_sota1_expansion_rounds: int,
     ablations: set[str],
+    model_profile: str | dict[str, Any] | None = "unknown",
 ) -> dict[str, Any]:
+    if strategy == "context-localized":
+        return context_localized_context_files(
+            repo,
+            issue_text,
+            max_files=max_files,
+            max_bytes=max_bytes,
+            top_k=top_k,
+            line_window=line_window,
+            model_profile=model_profile,
+        )
     if strategy == "beat-sota1":
         return beat_sota1_context_files(
             repo,
@@ -2285,7 +2432,9 @@ def build_output_row(
     beat_sota1_regions_per_file: int,
     beat_sota1_expansion_rounds: int,
     ablations: set[str],
+    model_profile: str | dict[str, Any] | None = "unknown",
 ) -> dict[str, Any]:
+    profile = agent_contracts.model_profile_payload(model_profile)
     selection = select_context(
         repo,
         issue_text,
@@ -2294,10 +2443,11 @@ def build_output_row(
         max_bytes=max_bytes,
         top_k=top_k,
         line_window=line_window,
-        line_overlap=line_overlap,
+        line_overlap=0,
         beat_sota1_regions_per_file=beat_sota1_regions_per_file,
         beat_sota1_expansion_rounds=beat_sota1_expansion_rounds,
         ablations=ablations,
+        model_profile=profile,
     )
     if strategy == "beat-sota1":
         regions, region_trace = selection_to_regions_beat_sota1(
@@ -2309,6 +2459,27 @@ def build_output_row(
             line_overlap=line_overlap,
             regions_per_file=beat_sota1_regions_per_file,
         )
+    elif strategy == "context-localized":
+        localized = selection.get("context_localized", {}).get("localization", {})
+        top_regions = localized.get("regions", [])[:top_k]
+        regions = [
+            {"path": item["path"], "start": int(item["start"]), "end": int(item["end"])}
+            for item in top_regions
+        ]
+        region_trace = [
+            {
+                "rank": index,
+                "strategy": "context-localized",
+                "operation": "region_emit",
+                "path": item["path"],
+                "start": int(item["start"]),
+                "end": int(item["end"]),
+                "score": item.get("score"),
+                "strength": item.get("strength"),
+                "evidence": item.get("evidence", []),
+            }
+            for index, item in enumerate(top_regions, start=1)
+        ]
     else:
         regions, region_trace = selection_to_regions(
             repo,
@@ -2323,6 +2494,7 @@ def build_output_row(
         "included_files": selection.get("included_files", []),
         "omitted_files": selection.get("omitted_files", []),
         "selected_bytes": selection.get("selected_bytes", 0),
+        "model_profile": profile,
         "limits": {
             "top_k": top_k,
             "max_files": max_files,
@@ -2343,6 +2515,18 @@ def build_output_row(
     }
     if "beat_sota1" in selection:
         metadata["beat_sota1"] = selection["beat_sota1"]
+    if "context_localized" in selection:
+        localized_candidates = selection["context_localized"]["localization"].get("file_candidates", [])
+        risk_counts = selection["context_localized"].get("risk_counts") or context_candidate_risk_counts(localized_candidates)
+        metadata["context_localized"] = {
+            "model_profile": selection["context_localized"].get("model_profile", profile),
+            "confidence": selection["context_localized"]["localization"].get("confidence"),
+            "gate": selection["context_localized"].get("gate"),
+            "signals": selection["context_localized"]["localization"].get("signals"),
+            "candidate_count": selection["context_localized"].get("all_candidate_count", len(localized_candidates)),
+            "region_count": len(selection["context_localized"]["localization"].get("regions", [])),
+            **risk_counts,
+        }
     return {
         "instance_id": record["instance_id"],
         "explorer": f"agent-contracts:{strategy}",
@@ -2421,6 +2605,102 @@ def build_agent_contracts_precontext(
         snippet = snippet_for_region(repo, region)
         if snippet:
             lines.extend(["```", snippet, "```"])
+    return "\n".join(lines), metadata
+
+
+def build_context_localized_precontext(
+    repo: Path,
+    issue_text: str,
+    *,
+    top_k: int,
+    max_files: int,
+    max_bytes: int,
+    line_window: int,
+    precontext_candidates: int,
+    precontext_max_chars: int,
+    model_profile: str | dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    profile = agent_contracts.model_profile_payload(model_profile)
+    selection = select_context(
+        repo,
+        issue_text,
+        "context-localized",
+        max_files=max_files,
+        max_bytes=max_bytes,
+        top_k=top_k,
+        line_window=line_window,
+        line_overlap=0,
+        beat_sota1_regions_per_file=DEFAULT_BEAT_SOTA1_REGIONS_PER_FILE,
+        beat_sota1_expansion_rounds=DEFAULT_BEAT_SOTA1_EXPANSION_ROUNDS,
+        ablations=set(),
+        model_profile=profile,
+    )
+    localized = selection.get("context_localized", {})
+    localization = localized.get("localization", {})
+    gate = localized.get("gate", {})
+    regions = [
+        {"path": item["path"], "start": int(item["start"]), "end": int(item["end"])}
+        for item in localization.get("regions", [])[:precontext_candidates]
+    ]
+    risk_counts = localized.get("risk_counts") or context_candidate_risk_counts(localization.get("file_candidates", []))
+    metadata = {
+        "strategy": "context-localized",
+        "model_profile": profile,
+        "included_files": selection.get("included_files", []),
+        "selected_bytes": selection.get("selected_bytes", 0),
+        "regions": regions,
+        "gate": gate,
+        "confidence": localization.get("confidence"),
+        "signals": localization.get("signals"),
+        "candidate_count": localized.get("all_candidate_count", len(localization.get("file_candidates", []))),
+        "region_count": len(localization.get("regions", [])),
+        "risk_counts": risk_counts,
+        "trace": selection.get("trace", []),
+    }
+
+    decision = gate.get("decision", "unknown")
+    confidence = gate.get("confidence", localization.get("confidence", "unknown"))
+    lines = [
+        "## context-localized Agent Contracts evidence",
+        "",
+        "This context is advisory. Form an independent hypothesis from the issue and repository before relying on these hints.",
+        "",
+        f"Model profile: {profile['name']}",
+        f"Gate decision: {decision}",
+        f"Gate confidence: {confidence}",
+        f"Fallback: {gate.get('fallback', 'unknown')}",
+        f"Selected bytes: {selection.get('selected_bytes', 0)}",
+        f"Noisy path count: {risk_counts.get('noisy_path_count', 0)}",
+        f"Vendored/noisy path count: {risk_counts.get('vendored_noisy_path_count', 0)}",
+        "",
+    ]
+    if decision in {"tool_only", "abstain"} or not regions:
+        lines.extend(
+            [
+                "No file names or snippets are preloaded for this gate decision.",
+                "Use repository tools directly and treat Agent Contracts as an audit trail only.",
+            ]
+        )
+        return "\n".join(lines), metadata
+
+    lines.extend(
+        [
+            "Selected files:",
+            *[f"- {path}" for path in selection.get("included_files", [])[:max_files]],
+            "",
+        ]
+    )
+    lines.append("Selected line regions:")
+    used_chars = len("\n".join(lines))
+    for index, region in enumerate(regions, start=1):
+        header = f"{index}. {region['path']}:{region['start']}-{region['end']}"
+        snippet = snippet_for_region(repo, region, max_chars=2_400 if profile["name"] == "spark" else 4_000)
+        block = "\n".join([header, "```", snippet, "```", ""])
+        if used_chars + len(block) > precontext_max_chars:
+            lines.append("[localized snippets truncated by precontext budget]")
+            break
+        lines.append(block)
+        used_chars += len(block)
     return "\n".join(lines), metadata
 
 
@@ -2506,6 +2786,8 @@ def beat_sota2_is_noisy_precontext_path(path: str) -> bool:
     path_obj = Path(path)
     lowered_parts = {part.lower() for part in path_obj.parts}
     lowered_name = path_obj.name.lower()
+    if agent_contracts.context_path_risk_flags(path):
+        return True
     if lowered_name in SOTA2_NOISY_PRECONTEXT_NAMES:
         return True
     if MINIFIED_RE.search(path) or "jquery" in lowered_name:
@@ -2770,6 +3052,11 @@ def build_codex_prompt(
                 "Use the following beatSOTA1 scored candidates as the primary evidence set. "
                 "Prefer reranking or narrowing these regions; replace a region only when repository evidence points elsewhere."
             )
+        elif strategy == "codex-context-localized":
+            guidance = (
+                "Use the following context-localized Agent Contracts evidence only after forming independent hypotheses "
+                "from the issue and repository. Respect tool-only or abstain gates by inspecting the repository directly."
+            )
         elif strategy == "codex-beat-sota2":
             guidance = (
                 "Use the following beatSOTA2 advisory evidence only after forming independent hypotheses from the issue "
@@ -2897,7 +3184,9 @@ def run_codex_explorer(
     beat_sota1_precontext_candidates: int,
     beat_sota1_precontext_max_chars: int,
     ablations: set[str],
+    model_profile: str | dict[str, Any] | None = "unknown",
 ) -> dict[str, Any]:
+    profile = agent_contracts.model_profile_payload(model_profile)
     if strategy in {"codex-beat-sota1", "codex-beat-sota2"} and "no-codex" in ablations:
         row = build_output_row(
             record,
@@ -2912,6 +3201,7 @@ def run_codex_explorer(
             beat_sota1_regions_per_file=beat_sota1_regions_per_file,
             beat_sota1_expansion_rounds=beat_sota1_expansion_rounds,
             ablations=ablations,
+            model_profile=profile,
         )
         row["explorer"] = f"agent-contracts:{strategy}"
         row["metadata"]["condition"] = strategy
@@ -2930,6 +3220,18 @@ def run_codex_explorer(
             max_bytes=max_bytes,
             line_window=line_window,
             line_overlap=line_overlap,
+        )
+    elif strategy == "codex-context-localized":
+        precontext, precontext_metadata = build_context_localized_precontext(
+            repo,
+            issue_text,
+            top_k=top_k,
+            max_files=max_files,
+            max_bytes=max_bytes,
+            line_window=line_window,
+            precontext_candidates=beat_sota1_precontext_candidates,
+            precontext_max_chars=beat_sota1_precontext_max_chars,
+            model_profile=profile,
         )
     elif strategy == "codex-beat-sota1":
         precontext, precontext_metadata = build_beat_sota1_precontext(
@@ -3003,6 +3305,7 @@ def run_codex_explorer(
 
     metadata = {
         "condition": strategy,
+        "model_profile": profile,
         "codex_command": codex_command,
         "codex_returncode": completed.returncode if completed is not None else None,
         "runner_error": runner_error,
@@ -3025,6 +3328,11 @@ def run_codex_explorer(
             *(
                 ["agent_contracts_precontext"]
                 if strategy == "codex-agent-contracts"
+                else []
+            ),
+            *(
+                ["context_localized_precontext"]
+                if strategy == "codex-context-localized"
                 else []
             ),
             *(
@@ -3098,6 +3406,7 @@ def run(args: argparse.Namespace) -> int:
                 beat_sota1_precontext_candidates=args.beat_sota1_precontext_candidates,
                 beat_sota1_precontext_max_chars=args.beat_sota1_precontext_max_chars,
                 ablations=set(args.ablation or []),
+                model_profile=args.model_profile,
             )
             if args.evaluate:
                 output_rows.append(row)
@@ -3118,6 +3427,7 @@ def run(args: argparse.Namespace) -> int:
             beat_sota1_regions_per_file=args.beat_sota1_regions_per_file,
             beat_sota1_expansion_rounds=args.beat_sota1_expansion_rounds,
             ablations=set(args.ablation or []),
+            model_profile=args.model_profile,
         )
         if args.evaluate:
             output_rows.append(row)
@@ -3141,6 +3451,7 @@ def run(args: argparse.Namespace) -> int:
             {
                 "output": output_path.as_posix(),
                 "strategy": args.strategy,
+                "model_profile": args.model_profile,
                 "written": written,
                 "resumed": len(completed),
                 "skipped_missing_repo": skipped_missing_repo,
@@ -3164,6 +3475,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--strategy", choices=STRATEGIES, default="contract-ranked")
     parser.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES)
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    parser.add_argument("--model-profile", choices=agent_contracts.MODEL_PROFILE_NAMES, default="unknown")
     parser.add_argument("--line-window", type=int, default=80)
     parser.add_argument("--line-overlap", type=int, default=20)
     parser.add_argument("--beat-sota1-regions-per-file", type=int, default=DEFAULT_BEAT_SOTA1_REGIONS_PER_FILE)

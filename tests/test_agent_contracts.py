@@ -17,6 +17,7 @@ from scripts import agent_contracts, agent_contracts_mcp, swe_explore_agent_cont
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "agent_contracts.py"
 SWE_SCRIPT = ROOT / "scripts" / "swe_explore_agent_contracts.py"
+QUICK_SPARK_SCRIPT = ROOT / "scripts" / "quick_swe_spark_eval.py"
 REPAIR_SCRIPT = ROOT / "scripts" / "swe_restricted_repair.py"
 
 
@@ -109,6 +110,75 @@ def write_tiny_swe_explore_fixture(base: Path) -> tuple[Path, Path, Path, Path]:
     )
     output = base / "results.jsonl"
     return bench, base, issue_map, output
+
+
+def write_context_localization_fixture(base: Path) -> Path:
+    repo = base / "repo"
+    (repo / "src" / "billing").mkdir(parents=True)
+    (repo / "tests").mkdir(parents=True)
+    (repo / "docs").mkdir(parents=True)
+    (repo / "vendor" / "billing").mkdir(parents=True)
+    (repo / "requests" / "packages" / "urllib3").mkdir(parents=True)
+    (repo / "requests" / "packages" / "chardet").mkdir(parents=True)
+    (repo / "src" / "billing" / "api.py").write_text(
+        "\n".join(
+            [
+                "class PaymentStatus:",
+                "    pass",
+                "",
+                "def helper():",
+                "    return 'unchanged'",
+                "",
+                "def payment_status(user_token):",
+                "    token_state = validate_token(user_token)",
+                "    if token_state.renewal_required:",
+                "        return 'renewal-required'",
+                "    return 'paid'",
+                "",
+                "def validate_hostname(hostname):",
+                "    if hostname == 'localhost':",
+                "        return True",
+                "    return hostname.endswith('.example.test')",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (repo / "tests" / "test_billing.py").write_text(
+        "\n".join(
+            [
+                "from billing.api import payment_status, validate_hostname",
+                "",
+                "def test_payment_status_renewal_required():",
+                "    assert payment_status('needs-renewal') == 'renewal-required'",
+                "",
+                "def test_validate_hostname_localhost():",
+                "    assert validate_hostname('localhost')",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (repo / "docs" / "billing.md").write_text(
+        "payment status renewal required hostname validation billing billing billing\n" * 12,
+        encoding="utf-8",
+    )
+    (repo / "vendor" / "billing" / "legacy.py").write_text(
+        "def payment_status(user_token):\n    return 'vendor renewal-required'\n",
+        encoding="utf-8",
+    )
+    (repo / "requests" / "packages" / "urllib3" / "connectionpool.py").write_text(
+        "def payment_status(user_token):\n"
+        "    # vendored dependency copy mentioning renewal required hostname validation\n"
+        "    return 'urllib3 renewal-required hostname validation'\n",
+        encoding="utf-8",
+    )
+    (repo / "requests" / "packages" / "chardet" / "compat.py").write_text(
+        "def validate_hostname(hostname):\n"
+        "    return hostname.endswith('.vendored.test')\n",
+        encoding="utf-8",
+    )
+    return repo
 
 
 class AgentContractsTests(unittest.TestCase):
@@ -208,6 +278,319 @@ class AgentContractsTests(unittest.TestCase):
             self.assertEqual(manifest["module"]["name"], "billing")
             self.assertIn("src/billing/api.py", manifest["included_files"])
 
+    def test_issue_signal_extractor_captures_paths_tracebacks_symbols_and_terms(self) -> None:
+        signals = agent_contracts.extract_issue_signals(
+            "Fix `renewal-required` in src/billing/api.py:9. Traceback File \"src/billing/api.py\", "
+            "line 9, in payment_status. test_payment_status_renewal_required should not regress."
+        )
+
+        self.assertEqual(signals.intent, "bugfix")
+        self.assertIn("src/billing/api.py", signals.path_hints)
+        self.assertEqual(signals.traceback_lines["src/billing/api.py"], [9])
+        self.assertIn("payment_status", signals.symbols)
+        self.assertIn("test_payment_status_renewal_required", signals.test_names)
+        self.assertIn("renewal-required", signals.quoted_terms)
+        self.assertIn("should not", signals.negative_terms)
+
+    def test_context_localizer_prioritizes_exact_path_symbol_and_traceback_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            result = agent_contracts.localize_issue_context(
+                repo,
+                "Fix src/billing/api.py:9 payment_status returning `renewal-required`.",
+                max_candidate_files=8,
+                max_regions=4,
+                line_window=4,
+            )
+
+        self.assertEqual(result["file_candidates"][0]["path"], "src/billing/api.py")
+        evidence_kinds = {item["kind"] for item in result["file_candidates"][0]["evidence"]}
+        self.assertIn("exact_path", evidence_kinds)
+        self.assertIn("traceback", evidence_kinds)
+        self.assertIn("symbol", evidence_kinds)
+        self.assertEqual(result["confidence"], "high")
+        self.assertTrue(any(region["path"] == "src/billing/api.py" and region["start"] <= 9 <= region["end"] for region in result["regions"]))
+
+    def test_context_localizer_keeps_exact_path_region_without_line_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            result = agent_contracts.localize_issue_context(
+                repo,
+                "Fix src/billing/api.py",
+                max_candidate_files=4,
+                max_regions=1,
+                line_window=4,
+            )
+
+        self.assertEqual(result["regions"][0]["path"], "src/billing/api.py")
+        self.assertEqual(result["regions"][0]["strength"], "strong")
+        self.assertIn("exact_path", {item["kind"] for item in result["regions"][0]["evidence"]})
+
+    def test_context_localizer_demotes_noisy_paths_unless_directly_named(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            result = agent_contracts.localize_issue_context(
+                repo,
+                "Payment status renewal required hostname validation bug.",
+                max_candidate_files=8,
+                max_regions=4,
+                line_window=6,
+            )
+            direct_vendor = agent_contracts.localize_issue_context(
+                repo,
+                "Fix vendor/billing/legacy.py payment_status renewal-required.",
+                max_candidate_files=8,
+                max_regions=4,
+                line_window=6,
+            )
+
+        self.assertEqual(result["file_candidates"][0]["path"], "src/billing/api.py")
+        doc_candidate = next((item for item in result["file_candidates"] if item["path"] == "docs/billing.md"), None)
+        if doc_candidate is not None:
+            self.assertIn("docs", doc_candidate["risk_flags"])
+            self.assertLess(doc_candidate["score"], result["file_candidates"][0]["score"])
+        self.assertEqual(direct_vendor["file_candidates"][0]["path"], "vendor/billing/legacy.py")
+        self.assertIn("vendor_generated_static", direct_vendor["file_candidates"][0]["risk_flags"])
+
+    def test_context_localizer_demotes_requests_style_vendored_dependencies_unless_directly_named(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            result = agent_contracts.localize_issue_context(
+                repo,
+                "payment_status renewal required hostname validation bug.",
+                max_candidate_files=20,
+                max_regions=6,
+                line_window=6,
+            )
+            direct_dependency = agent_contracts.localize_issue_context(
+                repo,
+                "Fix requests/packages/urllib3/connectionpool.py payment_status renewal-required.",
+                max_candidate_files=20,
+                max_regions=6,
+                line_window=6,
+            )
+
+        self.assertEqual(result["file_candidates"][0]["path"], "src/billing/api.py")
+        dependency_candidate = next(
+            item for item in result["file_candidates"] if item["path"] == "requests/packages/urllib3/connectionpool.py"
+        )
+        self.assertIn("vendor_generated_static", dependency_candidate["risk_flags"])
+        self.assertLess(dependency_candidate["score"], result["file_candidates"][0]["score"])
+        self.assertTrue(any(item["kind"] == "risk_penalty" for item in dependency_candidate["evidence"]))
+        self.assertEqual(direct_dependency["file_candidates"][0]["path"], "requests/packages/urllib3/connectionpool.py")
+        self.assertIn("vendor_generated_static", direct_dependency["file_candidates"][0]["risk_flags"])
+
+    def test_context_localizer_pairs_source_and_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            result = agent_contracts.localize_issue_context(
+                repo,
+                "test_payment_status_renewal_required fails around payment_status.",
+                max_candidate_files=8,
+                max_regions=4,
+                line_window=5,
+            )
+
+        paths = [item["path"] for item in result["file_candidates"]]
+        self.assertIn("tests/test_billing.py", paths)
+        self.assertIn("src/billing/api.py", paths)
+        source = next(item for item in result["file_candidates"] if item["path"] == "src/billing/api.py")
+        self.assertIn("test_pair", {item["kind"] for item in source["evidence"]})
+
+    def test_no_harm_gate_abstains_or_tool_only_for_broad_module_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            localization = agent_contracts.localize_issue_context(repo, "Update the billing module behavior.", include_internal_indexes=True)
+            baseline = agent_contracts.baseline_retrieve_context(
+                repo,
+                "Update the billing module behavior.",
+                search_index=localization.get("_search_index"),
+            )
+            gate = agent_contracts.evaluate_context_quality(
+                localization,
+                baseline,
+                estimate=agent_contracts.estimate_candidate_bytes(repo, localization["file_candidates"][:12]),
+                model_profile="spark",
+            )
+
+        self.assertEqual(gate["decision"], "tool_only")
+        self.assertEqual(gate["confidence"], "low")
+        self.assertEqual(gate["fallback"], "progressive_tools")
+        self.assertEqual(gate["limits"]["max_preloaded_regions"], 0)
+
+    def test_no_harm_gate_injects_or_advises_exact_path_symbol_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            localization = agent_contracts.localize_issue_context(
+                repo,
+                "Fix src/billing/api.py payment_status renewal-required.",
+                include_internal_indexes=True,
+            )
+            baseline = agent_contracts.baseline_retrieve_context(
+                repo,
+                "Fix src/billing/api.py payment_status renewal-required.",
+                search_index=localization.get("_search_index"),
+            )
+            gate = agent_contracts.evaluate_context_quality(
+                localization,
+                baseline,
+                estimate=agent_contracts.estimate_candidate_bytes(repo, localization["file_candidates"][:12]),
+                model_profile="frontier",
+            )
+
+        self.assertEqual(gate["decision"], "inject")
+        self.assertEqual(gate["confidence"], "high")
+        self.assertEqual(gate["fallback"], "none")
+        self.assertEqual(gate["limits"]["max_preloaded_regions"], 6)
+        self.assertIn("direct issue evidence present", gate["reasons"])
+
+    def test_no_harm_gate_abstains_without_candidates(self) -> None:
+        gate = agent_contracts.evaluate_context_quality(
+            {"file_candidates": [], "regions": [], "confidence": "low", "limits": {"max_bytes": 1}},
+            {"candidates": []},
+            model_profile="unknown",
+        )
+
+        self.assertEqual(gate["decision"], "abstain")
+        self.assertEqual(gate["fallback"], "baseline_search")
+
+    def test_context_pack_v2_schema_contains_guardrails_and_advisory_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            pack = agent_contracts.build_context_pack_v2(
+                repo,
+                "Fix src/billing/api.py payment_status renewal-required.",
+                model_profile="spark",
+                max_regions=4,
+                line_window=5,
+            )
+
+        self.assertEqual(pack["schema_version"], 2)
+        self.assertIn(pack["gate"]["decision"], {"inject", "advisory"})
+        self.assertIn("First form an independent hypothesis", pack["prompt_contract"])
+        self.assertIn("safe_to_edit", pack["boundaries"])
+        self.assertTrue(pack["verification"]["tests"])
+        self.assertTrue(all(item["strength"] in {"strong", "medium"} for item in pack["evidence"]))
+
+    def test_context_pack_v2_no_preload_and_output_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            broad_pack = agent_contracts.build_context_pack_v2(
+                repo,
+                "Payment status renewal required hostname validation bug.",
+                model_profile="unknown",
+                max_regions=4,
+                line_window=5,
+            )
+            output = Path(tmp) / "pack-v2"
+            written_pack = agent_contracts.build_context_pack_v2(
+                repo,
+                "Fix src/billing/api.py payment_status renewal-required.",
+                output,
+                model_profile="frontier",
+                max_regions=4,
+                line_window=5,
+            )
+            self.assertTrue((output / "manifest.json").exists())
+            self.assertTrue((output / "README.md").exists())
+            self.assertEqual(json.loads((output / "manifest.json").read_text(encoding="utf-8"))["schema_version"], 2)
+            self.assertEqual(written_pack["manifest_path"], (output / "manifest.json").as_posix())
+
+        self.assertEqual(broad_pack["gate"]["decision"], "tool_only")
+        self.assertEqual(broad_pack["evidence"], [])
+        self.assertEqual(broad_pack["hypotheses"][0]["confidence"], "low")
+        self.assertEqual(broad_pack["localization"]["file_candidates"], [])
+        self.assertEqual(broad_pack["localization"]["regions"], [])
+        self.assertIn("redaction_reason", broad_pack["localization"]["audit_only"])
+        self.assertTrue(any("gate decision tool_only" in item["reason"] for item in broad_pack["omissions"]))
+
+    def test_context_v2_cli_and_region_read_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            localize = run_cli(
+                "context-localize",
+                "Fix src/billing/api.py payment_status renewal-required.",
+                "--max-regions",
+                "3",
+                "--line-window",
+                "5",
+                "--format",
+                "json",
+                repo=repo,
+            )
+            read_region = run_cli(
+                "context-read-region",
+                "src/billing/api.py",
+                "7",
+                "10",
+                "--format",
+                "json",
+                repo=repo,
+            )
+
+        self.assertEqual(localize.returncode, 0, localize.stderr)
+        self.assertEqual(json.loads(localize.stdout)["file_candidates"][0]["path"], "src/billing/api.py")
+        self.assertEqual(read_region.returncode, 0, read_region.stderr)
+        self.assertIn("renewal-required", json.loads(read_region.stdout)["content"])
+
+    def test_context_read_region_guardrails_and_context_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            (repo / "src" / "billing" / "empty.py").write_text("", encoding="utf-8")
+
+            expanded = agent_contracts.read_region_payload(repo, "src/billing/api.py", 9, 9, context_lines=2)
+            empty = agent_contracts.read_region_payload(repo, "src/billing/empty.py", 1, 1)
+
+            with self.assertRaises(ValueError):
+                agent_contracts.read_region_payload(repo, "../secret.py", 1, 1)
+            with self.assertRaises(ValueError):
+                agent_contracts.read_region_payload(repo, "/tmp/secret.py", 1, 1)
+            with self.assertRaises(ValueError):
+                agent_contracts.read_region_payload(repo, "src/billing/missing.py", 1, 1)
+            with self.assertRaises(ValueError):
+                agent_contracts_mcp.call_tool(
+                    "context_read_region",
+                    {"repo": str(repo), "path": "src/billing/api.py", "start": 1, "end": 1, "context_lines": -1},
+                )
+
+        self.assertEqual(expanded["start"], 7)
+        self.assertEqual(expanded["end"], 11)
+        self.assertIn("payment_status", expanded["content"])
+        self.assertTrue(expanded["nearby_tests"])
+        self.assertEqual(empty["content"], "")
+        self.assertEqual(empty["end"], 0)
+
+    def test_context_v2_cli_rejects_invalid_numeric_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            bad_window = run_cli(
+                "context-localize",
+                "Fix src/billing/api.py",
+                "--line-window",
+                "0",
+                repo=repo,
+            )
+            bad_region_order = run_cli(
+                "context-read-region",
+                "src/billing/api.py",
+                "10",
+                "2",
+                repo=repo,
+            )
+            bad_context_lines = run_cli(
+                "context-read-region",
+                "src/billing/api.py",
+                "1",
+                "2",
+                "--context-lines",
+                "-1",
+                repo=repo,
+            )
+
+        self.assertEqual(bad_window.returncode, 2)
+        self.assertEqual(bad_region_order.returncode, 2)
+        self.assertEqual(bad_context_lines.returncode, 2)
+
     def test_context_discover_json_includes_compact_catalog(self) -> None:
         result = run_cli("context-discover", "--format", "json", repo=ROOT / "fixtures" / "python-service")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -262,13 +645,165 @@ class AgentContractsTests(unittest.TestCase):
             shutil.copytree(ROOT / "fixtures" / "python-service", target)
             self.assertTrue(agent_contracts.initialize_trial_git_repo(target))
             agent_contracts.clear_module_map_cache()
+            agent_contracts.clear_localization_index_cache()
 
             agent_contracts.build_module_map(target)
+            agent_contracts.build_repo_search_index(target)
 
             cache_path = agent_contracts.module_map_cache_path(target)
+            search_cache_path = agent_contracts.localization_index_cache_path(target, "search_index")
             self.assertTrue(cache_path.is_file())
+            self.assertTrue(search_cache_path.is_file())
             self.assertTrue(cache_path.is_relative_to(target.resolve() / ".git"))
+            self.assertTrue(search_cache_path.is_relative_to(target.resolve() / ".git"))
             self.assertEqual(agent_contracts.git_changed_files(target), [])
+
+    def test_localization_index_cache_is_reused_and_invalidated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "repo"
+            shutil.copytree(ROOT / "fixtures" / "python-service", target)
+            agent_contracts.clear_localization_index_cache()
+
+            first_indexes, first_freshness = agent_contracts.build_context_localization_indexes(target)
+            self.assertEqual(first_freshness["search_index"], "recomputed")
+            self.assertEqual(first_freshness["symbol_index"], "recomputed")
+            self.assertEqual(first_freshness["test_index"], "recomputed")
+            self.assertEqual(
+                first_indexes["search_index"]["fingerprint"]["extra"]["schema_version"],
+                agent_contracts.CONTEXT_LOCALIZATION_INDEX_SCHEMA_VERSION,
+            )
+            for index_name in ("search_index", "symbol_index", "test_index"):
+                self.assertTrue(agent_contracts.localization_index_cache_path(target, index_name).is_file())
+
+            with (
+                mock.patch.object(
+                    agent_contracts,
+                    "build_repo_search_index_from_files",
+                    side_effect=AssertionError("expected cached search index"),
+                ),
+                mock.patch.object(
+                    agent_contracts,
+                    "build_symbol_index_from_files",
+                    side_effect=AssertionError("expected cached symbol index"),
+                ),
+                mock.patch.object(
+                    agent_contracts,
+                    "build_test_index_from_files",
+                    side_effect=AssertionError("expected cached test index"),
+                ),
+            ):
+                cached_indexes, cached_freshness = agent_contracts.build_context_localization_indexes(target)
+            self.assertEqual(cached_indexes["search_index"]["fingerprint"], first_indexes["search_index"]["fingerprint"])
+            self.assertEqual(cached_freshness["search_index"], "memory_hit")
+            self.assertEqual(cached_freshness["symbol_index"], "memory_hit")
+            self.assertEqual(cached_freshness["test_index"], "memory_hit")
+
+            api_path = target / "src" / "billing" / "api.py"
+            api_path.write_text(
+                api_path.read_text(encoding="utf-8") + "\ndef cache_invalidation_marker():\n    return True\n",
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(
+                    agent_contracts,
+                    "build_repo_search_index_from_files",
+                    wraps=agent_contracts.build_repo_search_index_from_files,
+                ) as search_builder,
+                mock.patch.object(
+                    agent_contracts,
+                    "build_symbol_index_from_files",
+                    wraps=agent_contracts.build_symbol_index_from_files,
+                ) as symbol_builder,
+                mock.patch.object(
+                    agent_contracts,
+                    "build_test_index_from_files",
+                    wraps=agent_contracts.build_test_index_from_files,
+                ) as test_builder,
+            ):
+                refreshed_indexes, refreshed_freshness = agent_contracts.build_context_localization_indexes(target)
+            self.assertEqual(search_builder.call_count, 1)
+            self.assertEqual(symbol_builder.call_count, 1)
+            self.assertEqual(test_builder.call_count, 1)
+            self.assertEqual(refreshed_freshness["search_index"], "recomputed")
+            self.assertNotEqual(
+                refreshed_indexes["search_index"]["fingerprint"]["digest"],
+                first_indexes["search_index"]["fingerprint"]["digest"],
+            )
+
+    def test_localization_index_cache_respects_disable_env_var(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "repo"
+            shutil.copytree(ROOT / "fixtures" / "python-service", target)
+            agent_contracts.clear_localization_index_cache()
+
+            with (
+                mock.patch.dict(os.environ, {agent_contracts.MODULE_MAP_CACHE_ENV: "1"}),
+                mock.patch.object(
+                    agent_contracts,
+                    "build_repo_search_index_from_files",
+                    wraps=agent_contracts.build_repo_search_index_from_files,
+                ) as search_builder,
+                mock.patch.object(
+                    agent_contracts,
+                    "build_symbol_index_from_files",
+                    wraps=agent_contracts.build_symbol_index_from_files,
+                ) as symbol_builder,
+                mock.patch.object(
+                    agent_contracts,
+                    "build_test_index_from_files",
+                    wraps=agent_contracts.build_test_index_from_files,
+                ) as test_builder,
+            ):
+                _first_indexes, first_freshness = agent_contracts.build_context_localization_indexes(target)
+                _second_indexes, second_freshness = agent_contracts.build_context_localization_indexes(target)
+
+            self.assertEqual(search_builder.call_count, 2)
+            self.assertEqual(symbol_builder.call_count, 2)
+            self.assertEqual(test_builder.call_count, 2)
+            self.assertEqual(first_freshness["search_index"], "disabled")
+            self.assertEqual(second_freshness["symbol_index"], "disabled")
+            self.assertEqual(second_freshness["test_index"], "disabled")
+
+    def test_common_v2_flow_reuses_warmed_localization_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            agent_contracts.clear_module_map_cache()
+            agent_contracts.clear_localization_index_cache()
+            task = "Fix src/billing/api.py payment_status renewal-required."
+            agent_contracts.localize_issue_context(repo, task, include_internal_indexes=True)
+
+            with (
+                mock.patch.object(
+                    agent_contracts,
+                    "build_module_map_from_files",
+                    side_effect=AssertionError("expected cached module map"),
+                ),
+                mock.patch.object(
+                    agent_contracts,
+                    "build_repo_search_index_from_files",
+                    side_effect=AssertionError("expected cached search index"),
+                ),
+                mock.patch.object(
+                    agent_contracts,
+                    "build_symbol_index_from_files",
+                    side_effect=AssertionError("expected cached symbol index"),
+                ),
+                mock.patch.object(
+                    agent_contracts,
+                    "build_test_index_from_files",
+                    side_effect=AssertionError("expected cached test index"),
+                ),
+            ):
+                gate = agent_contracts.context_gate_payload(repo, task, model_profile="spark")
+                pack = agent_contracts.build_context_pack_v2(repo, task, model_profile="spark")
+                region = agent_contracts.read_region_payload(repo, "src/billing/api.py", 7, 11, context_lines=1)
+                expansion = agent_contracts.context_expand_payload(repo, "src/billing/api.py")
+
+            self.assertIn("gate", gate)
+            self.assertEqual(pack["model_profile"]["name"], "spark")
+            self.assertTrue(region["symbols"])
+            self.assertTrue(any(item["path"] == "tests/test_billing.py" for item in expansion["neighbors"]))
 
     def test_mcp_context_read_reuses_discover_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1054,7 +1589,19 @@ class AgentContractsTests(unittest.TestCase):
         names = {tool["name"] for tool in tools}
         self.assertEqual(
             names,
-            {"context_discover", "context_read", "context_pack", "context_verify"},
+            {
+                "context_discover",
+                "context_read",
+                "context_pack",
+                "context_verify",
+                "context_intent",
+                "context_localize",
+                "context_read_region",
+                "context_expand",
+                "context_gate",
+                "context_pack_v2",
+                "context_explain",
+            },
         )
         self.assertNotIn("read_whole_repo", names)
 
@@ -1092,6 +1639,53 @@ class AgentContractsTests(unittest.TestCase):
             selected_paths = {item["path"] for item in payload["selected_files"]}
             self.assertIn("src/billing/api.py", selected_paths)
             self.assertNotIn("content", payload["selected_files"][0])
+
+    def test_mcp_context_localize_and_pack_v2_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = write_context_localization_fixture(Path(tmp))
+            output = Path(tmp) / "mcp-pack-v2"
+            intent = agent_contracts_mcp.call_tool(
+                "context_intent",
+                {"task": "Fix src/billing/api.py payment_status renewal-required."},
+            )
+            localize = agent_contracts_mcp.call_tool(
+                "context_localize",
+                {"repo": str(repo), "task": "Fix src/billing/api.py payment_status renewal-required.", "max_regions": 3},
+            )
+            expand = agent_contracts_mcp.call_tool(
+                "context_expand",
+                {"repo": str(repo), "path": "src/billing/api.py"},
+            )
+            gate = agent_contracts_mcp.call_tool(
+                "context_gate",
+                {"repo": str(repo), "task": "Fix src/billing/api.py payment_status renewal-required.", "model_profile": "frontier"},
+            )
+            pack = agent_contracts_mcp.call_tool(
+                "context_pack_v2",
+                {
+                    "repo": str(repo),
+                    "task": "Fix src/billing/api.py payment_status renewal-required.",
+                    "model_profile": "spark",
+                    "output": str(output),
+                },
+            )
+            explain = agent_contracts_mcp.call_tool(
+                "context_explain",
+                {"repo": str(repo), "task": "Fix src/billing/api.py payment_status renewal-required."},
+            )
+            self.assertTrue((output / "manifest.json").exists())
+            self.assertEqual(Path(pack["manifest_path"]).resolve(), (output / "manifest.json").resolve())
+
+        self.assertEqual(intent["intent"], "bugfix")
+        self.assertIn("context_localize", {item["name"] for item in intent["recommended_tools"]})
+        self.assertEqual(localize["file_candidates"][0]["path"], "src/billing/api.py")
+        self.assertTrue(any(item["path"] == "tests/test_billing.py" for item in expand["neighbors"]))
+        self.assertEqual(gate["gate"]["decision"], "inject")
+        self.assertEqual(pack["schema_version"], 2)
+        self.assertIn("gate", pack)
+        self.assertIn("boundaries", pack)
+        self.assertIn("included", explain)
+        self.assertIn("boundaries", explain)
 
     def test_mcp_context_verify_smoke(self) -> None:
         payload = agent_contracts_mcp.call_tool(
@@ -1144,6 +1738,10 @@ class AgentContractsTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             bench, repos, issue_map, output = write_tiny_swe_explore_fixture(Path(tmp))
+            issue_map.write_text(
+                json.dumps({"demo__repo-1": "Fix src/billing/api.py payment_status renewal-required."}),
+                encoding="utf-8",
+            )
 
             result = subprocess.run(
                 [
@@ -1203,6 +1801,293 @@ class AgentContractsTests(unittest.TestCase):
                 any(region["path"] == "src/billing/api.py" for region in row["regions"]),
                 row["regions"],
             )
+
+    def test_swe_explore_adapter_context_localized_outputs_gate_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench, repos, issue_map, output = write_tiny_swe_explore_fixture(Path(tmp))
+            issue_map.write_text(
+                json.dumps({"demo__repo-1": "Fix src/billing/api.py payment_status renewal-required."}),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SWE_SCRIPT),
+                    "--bench",
+                    str(bench),
+                    "--repos",
+                    str(repos),
+                    "--issue-map",
+                    str(issue_map),
+                    "--strategy",
+                    "context-localized",
+                    "--top-k",
+                    "2",
+                    "--line-window",
+                    "6",
+                    "--line-overlap",
+                    "2",
+                    "--output",
+                    str(output),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            row = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(row["explorer"], "agent-contracts:context-localized")
+            self.assertLessEqual(row["num_regions"], 2)
+            self.assertTrue(any(region["path"] == "src/billing/api.py" for region in row["regions"]))
+            self.assertTrue(all(region["path"] in set(row["metadata"]["included_files"]) for region in row["regions"]))
+            self.assertFalse(
+                set(row["metadata"]["included_files"])
+                & {item["path"] for item in row["metadata"]["omitted_files"] if "path" in item}
+            )
+            self.assertIn("context_localized", row["metadata"])
+            self.assertIn(row["metadata"]["context_localized"]["gate"]["decision"], {"inject", "advisory", "tool_only", "abstain"})
+            self.assertTrue(any(item.get("operation") == "region_emit" for item in row["metadata"]["trace"]))
+
+    def test_swe_explore_context_localized_model_profile_spark_uses_spark_gate_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench, repos, issue_map, output = write_tiny_swe_explore_fixture(Path(tmp))
+            issue_map.write_text(
+                json.dumps({"demo__repo-1": "Fix src/billing/api.py payment_status renewal-required."}),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SWE_SCRIPT),
+                    "--bench",
+                    str(bench),
+                    "--repos",
+                    str(repos),
+                    "--issue-map",
+                    str(issue_map),
+                    "--strategy",
+                    "context-localized",
+                    "--model-profile",
+                    "spark",
+                    "--top-k",
+                    "5",
+                    "--line-window",
+                    "6",
+                    "--line-overlap",
+                    "2",
+                    "--output",
+                    str(output),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            summary = json.loads(result.stdout)
+            row = json.loads(output.read_text(encoding="utf-8"))
+            gate = row["metadata"]["context_localized"]["gate"]
+
+            self.assertEqual(summary["model_profile"], "spark")
+            self.assertEqual(row["metadata"]["model_profile"]["name"], "spark")
+            self.assertEqual(row["metadata"]["context_localized"]["model_profile"]["name"], "spark")
+            self.assertEqual(gate["model_profile"]["name"], "spark")
+            self.assertEqual(gate["limits"]["max_preloaded_chars"], 12_000)
+            self.assertLessEqual(gate["limits"]["max_preloaded_regions"], 3)
+
+    def test_swe_explore_context_localized_precontext_records_gate_and_noise_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench, repos, issue_map, _output = write_tiny_swe_explore_fixture(Path(tmp))
+            issue_text = json.loads(issue_map.read_text(encoding="utf-8"))["demo__repo-1"]
+            repo = repos / "demo__repo-1"
+
+            precontext, metadata = swe_explore_agent_contracts.build_context_localized_precontext(
+                repo,
+                issue_text,
+                top_k=3,
+                max_files=8,
+                max_bytes=100_000,
+                line_window=6,
+                precontext_candidates=4,
+                precontext_max_chars=8_000,
+                model_profile="spark",
+            )
+
+        self.assertIn("Gate decision:", precontext)
+        self.assertEqual(metadata["model_profile"]["name"], "spark")
+        self.assertIn("gate", metadata)
+        self.assertIn(metadata["gate"]["decision"], {"inject", "advisory", "tool_only", "abstain"})
+        self.assertIn("selected_bytes", metadata)
+        self.assertIn("risk_counts", metadata)
+        self.assertIn("noisy_path_count", metadata["risk_counts"])
+
+    def test_swe_explore_context_localized_precontext_hides_paths_for_tool_only_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repos = Path(tmp) / "repos"
+            repo = write_context_localization_fixture(repos)
+
+            precontext, metadata = swe_explore_agent_contracts.build_context_localized_precontext(
+                repo,
+                "Update the billing module behavior.",
+                top_k=3,
+                max_files=8,
+                max_bytes=100_000,
+                line_window=6,
+                precontext_candidates=4,
+                precontext_max_chars=8_000,
+                model_profile="spark",
+            )
+
+        self.assertEqual(metadata["gate"]["decision"], "tool_only")
+        self.assertIn("No file names or snippets are preloaded", precontext)
+        self.assertNotIn("src/billing/api.py", precontext)
+        self.assertNotIn("tests/test_billing.py", precontext)
+
+    def test_swe_explore_context_localized_regions_respect_file_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench, repos, issue_map, output = write_tiny_swe_explore_fixture(Path(tmp))
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SWE_SCRIPT),
+                    "--bench",
+                    str(bench),
+                    "--repos",
+                    str(repos),
+                    "--issue-map",
+                    str(issue_map),
+                    "--strategy",
+                    "context-localized",
+                    "--top-k",
+                    "3",
+                    "--max-files",
+                    "1",
+                    "--line-window",
+                    "6",
+                    "--line-overlap",
+                    "2",
+                    "--output",
+                    str(output),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            row = json.loads(output.read_text(encoding="utf-8"))
+            included = set(row["metadata"]["included_files"])
+            self.assertLessEqual(len(included), 1)
+            self.assertTrue(all(region["path"] in included for region in row["regions"]))
+            self.assertTrue(row["metadata"]["omitted_files"])
+
+    def test_swe_explore_context_localized_honors_tool_only_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bench, repos, issue_map, output = write_tiny_swe_explore_fixture(Path(tmp))
+            issue_map.write_text(
+                json.dumps({"demo__repo-1": "Update the billing module behavior."}),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SWE_SCRIPT),
+                    "--bench",
+                    str(bench),
+                    "--repos",
+                    str(repos),
+                    "--issue-map",
+                    str(issue_map),
+                    "--strategy",
+                    "context-localized",
+                    "--top-k",
+                    "3",
+                    "--line-window",
+                    "6",
+                    "--line-overlap",
+                    "2",
+                    "--output",
+                    str(output),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            row = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(row["metadata"]["context_localized"]["gate"]["decision"], "tool_only")
+            self.assertEqual(row["regions"], [])
+            self.assertEqual(row["num_regions"], 0)
+            self.assertFalse(any(item.get("operation") == "region_rank" for item in row["metadata"]["trace"]))
+
+    def test_swe_beat_sota2_noisy_filter_flags_requests_style_vendored_dependencies(self) -> None:
+        self.assertTrue(
+            swe_explore_agent_contracts.beat_sota2_is_noisy_precontext_path(
+                "requests/packages/urllib3/connectionpool.py"
+            )
+        )
+        self.assertTrue(
+            swe_explore_agent_contracts.beat_sota2_is_noisy_precontext_path(
+                "requests/packages/chardet/compat.py"
+            )
+        )
+        self.assertFalse(
+            swe_explore_agent_contracts.beat_sota2_is_noisy_precontext_path(
+                "packages/api/src/server.py"
+            )
+        )
+        self.assertFalse(
+            swe_explore_agent_contracts.beat_sota2_is_noisy_precontext_path(
+                "src/packages/api/server.py"
+            )
+        )
+        self.assertFalse(
+            swe_explore_agent_contracts.beat_sota2_is_noisy_precontext_path(
+                "project/packages/api/server.py"
+            )
+        )
+
+    def test_vendored_dependency_layout_path_only_flags_requests_style_packages(self) -> None:
+        positive_paths = [
+            "requests/packages/urllib3/connectionpool.py",
+            "requests/packages/chardet/compat.py",
+        ]
+        ordinary_package_paths = [
+            "packages/api/src/server.py",
+            "src/packages/api/server.py",
+            "project/packages/api/server.py",
+            "src/external/server.py",
+            "src/deps/server.py",
+        ]
+        root_dependency_paths = [
+            "external/urllib3/connectionpool.py",
+            "deps/chardet/compat.py",
+        ]
+
+        for path in positive_paths:
+            with self.subTest(path=path):
+                self.assertTrue(agent_contracts.is_vendored_dependency_layout_path(path))
+                self.assertIn("vendor_generated_static", agent_contracts.context_path_risk_flags(path))
+
+        for path in root_dependency_paths:
+            with self.subTest(path=path):
+                self.assertTrue(agent_contracts.is_vendored_dependency_layout_path(path))
+                self.assertIn("vendor_generated_static", agent_contracts.context_path_risk_flags(path))
+
+        for path in ordinary_package_paths:
+            with self.subTest(path=path):
+                self.assertFalse(agent_contracts.is_vendored_dependency_layout_path(path))
+                self.assertNotIn("vendor_generated_static", agent_contracts.context_path_risk_flags(path))
 
     def test_swe_explore_adapter_beat_sota1_outputs_scored_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1287,6 +2172,48 @@ class AgentContractsTests(unittest.TestCase):
             self.assertEqual(row["metadata"]["limits"]["ablations"], ["no-active"])
             self.assertFalse(any(item.get("operation") == "active_expansion" for item in row["metadata"]["trace"]))
 
+    def test_quick_swe_spark_eval_dry_run_prepares_subset_and_paired_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bench, repos, issue_map, _output = write_tiny_swe_explore_fixture(tmp_path)
+            output_dir = tmp_path / "quick"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(QUICK_SPARK_SCRIPT),
+                    "--bench",
+                    str(bench),
+                    "--repos",
+                    str(repos),
+                    "--issue-map",
+                    str(issue_map),
+                    "--output-dir",
+                    str(output_dir),
+                    "--fallback-limit",
+                    "1",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            summary = json.loads(result.stdout)
+            self.assertEqual(summary["mode"], "dry-run")
+            self.assertEqual(summary["instances"], ["demo__repo-1"])
+            self.assertTrue(Path(summary["subset_bench"]).is_file())
+            self.assertTrue(Path(summary["subset_issue_map"]).is_file())
+            condition_names = {item["condition"] for item in summary["conditions"]}
+            self.assertIn("spark_baseline", condition_names)
+            self.assertIn("context_localized_preflight", condition_names)
+            self.assertIn("spark_context_localized", condition_names)
+            commands = "\n".join(item["command"] for item in summary["conditions"])
+            self.assertIn("--strategy codex-baseline", commands)
+            self.assertIn("--strategy context-localized", commands)
+            self.assertIn("--strategy codex-context-localized", commands)
+            self.assertTrue(any("metadata.context_localized.gate" in command for command in summary["inspect"]))
+
     def test_swe_restricted_repair_mock_consumes_prediction_regions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1336,6 +2263,9 @@ class AgentContractsTests(unittest.TestCase):
             self.assertTrue(row["resolved"])
             self.assertEqual(row["region_count"], 1)
             self.assertGreater(row["context_bytes"], 0)
+            self.assertEqual(row["patch_bytes"], 0)
+            self.assertEqual(row["patch_lines"], 0)
+            self.assertEqual(row["files_edited_count"], 1)
 
     def test_swe_explore_adapter_output_order_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
