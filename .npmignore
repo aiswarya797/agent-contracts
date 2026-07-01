@@ -4,5 +4,4 @@ __pycache__/
 .coverage
 .agent-contracts/
 docs/
-fixtures/
 tests/

@@ -5,11 +5,13 @@ __pycache__/
 .pytest_cache/
 .coverage
 
+/.context/
+/benchmark-results/
+/docs/
+/examples/generated/
+
 .agent-contracts/cache/
 .agent-contracts/context-packs/
 .agent-contracts/drift-report.json
 .agent-contracts/refresh-plan.json
 .agent-contracts/init-plan.json
-
-docs/agent-contracts-plugin-prd.md
-docs/agent-contracts-plugin-lld.md
