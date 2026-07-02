@@ -28,8 +28,23 @@ except ImportError:  # pragma: no cover - direct script execution path
     import agent_contracts  # type: ignore[no-redef]
 
 
-STATIC_STRATEGIES = ("module", "graph-like", "progressive-mcp", "contract-ranked", "beat-sota1")
-AGENT_STRATEGIES = ("codex-baseline", "codex-agent-contracts", "codex-beat-sota1", "codex-beat-sota2")
+STATIC_STRATEGIES = (
+    "module",
+    "graph-like",
+    "progressive-mcp",
+    "contract-ranked",
+    "context-localized",
+    "beat-sota1",
+    "phase1-hybrid",
+)
+AGENT_STRATEGIES = (
+    "codex-baseline",
+    "codex-agent-contracts",
+    "codex-context-localized",
+    "codex-beat-sota1",
+    "codex-beat-sota2",
+    "codex-phase1-hybrid",
+)
 STRATEGIES = (*STATIC_STRATEGIES, *AGENT_STRATEGIES)
 DEFAULT_MAX_FILES = 80
 DEFAULT_MAX_BYTES = 700_000
@@ -44,6 +59,34 @@ DEFAULT_BEAT_SOTA1_PRECONTEXT_MAX_CHARS = 24_000
 DEFAULT_BEAT_SOTA1_PAIR_MATCH_LIMIT = 5
 DEFAULT_BEAT_SOTA2_PRECONTEXT_CANDIDATES = 6
 DEFAULT_BEAT_SOTA2_PRECONTEXT_MAX_CHARS = 12_000
+DEFAULT_PHASE1_HYBRID_PRECONTEXT_CANDIDATES = 8
+DEFAULT_PHASE1_HYBRID_PRECONTEXT_MAX_CHARS = 16_000
+PHASE1_RRF_K = 60
+PHASE1_REGION_FUSION_NEARBY_LINES = 12
+PHASE1_DIRECT_EVIDENCE_KINDS = {"exact_path", "traceback", "symbol", "test_name", "issue_literal", "error_message"}
+PHASE1_RISK_FLAGS = {"docs", "config", "vendor_generated_static", "generated", "generated_or_minified", "large_file", "precontext_noise"}
+PHASE1_BROAD_EVIDENCE_KINDS = {
+    "baseline_lexical",
+    "behavior_term",
+    "content_term",
+    "information_scent",
+    "module_prior",
+    "path_term",
+    "risk_penalty",
+    "test_pair",
+    "verification_discoverability",
+}
+PHASE1_FALLBACK_DECISIONS = {"tool_only", "abstain"}
+PHASE1_ADVISORY_DECISIONS = {"advisory_paths", "advisory_regions", "advisory_snippets"}
+PHASE1_PROVIDER_SET = [
+    "baseline",
+    "issue_localizer",
+    "fielded_lexical",
+    "symbols",
+    "tests",
+    "dependency_graph",
+    "beat_sota1",
+]
 BEAT_SOTA1_ABLATIONS = (
     "no-contracts",
     "no-graph",
@@ -305,6 +348,196 @@ class RetrievalChunk:
     end: int
     content: str
     tokens: list[str]
+
+
+@dataclasses.dataclass
+class Phase1CandidateBundle:
+    profile: dict[str, Any]
+    beat_selection: dict[str, Any]
+    beat_regions: list[dict[str, int | str]]
+    beat_region_trace: list[dict[str, Any]]
+    evidence: dict[str, EvidenceFile]
+    modules: list[agent_contracts.ModuleInfo]
+    content_idf: dict[str, float]
+    localization: dict[str, Any]
+    baseline: dict[str, Any]
+    local_gate: dict[str, Any]
+    local_candidates: dict[str, dict[str, Any]]
+    beat_candidate_files: list[dict[str, Any]]
+
+
+@dataclasses.dataclass
+class CandidateProvider:
+    repo: Path
+    issue_text: str
+    max_files: int
+    max_bytes: int
+    top_k: int
+    line_window: int
+    line_overlap: int
+    regions_per_file: int
+    expansion_rounds: int
+    ablations: set[str]
+    model_profile: str | dict[str, Any] | None = "mini"
+
+    def gather(self) -> Phase1CandidateBundle:
+        profile = agent_contracts.model_profile_payload(self.model_profile)
+        beat_selection = beat_sota1_context_files(
+            self.repo,
+            self.issue_text,
+            max_files=self.max_files,
+            max_bytes=self.max_bytes,
+            top_k=self.top_k,
+            line_window=self.line_window,
+            line_overlap=self.line_overlap,
+            regions_per_file=self.regions_per_file,
+            expansion_rounds=self.expansion_rounds,
+            ablations=self.ablations,
+        )
+        beat_regions, beat_region_trace = selection_to_regions_beat_sota1(
+            self.repo,
+            beat_selection,
+            self.issue_text,
+            top_k=max(self.top_k * 14, 70),
+            line_window=self.line_window,
+            line_overlap=self.line_overlap,
+            regions_per_file=self.regions_per_file,
+        )
+        evidence = beat_selection.get("_beat_sota1_evidence")
+        modules = beat_selection.get("_beat_sota1_modules")
+        content_idf = beat_selection.get("_beat_sota1_content_idf")
+        if not isinstance(evidence, dict) or not isinstance(modules, list) or not isinstance(content_idf, dict):
+            evidence, modules = build_evidence_index(self.repo, line_window=self.line_window)
+            content_idf = build_content_idf(evidence)
+        localization = agent_contracts.localize_issue_context(
+            self.repo,
+            self.issue_text,
+            max_candidate_files=max(self.max_files * 2, self.max_files + self.top_k),
+            max_regions=max(self.top_k * 14, 70),
+            line_window=self.line_window,
+            max_bytes=self.max_bytes,
+            model_profile=profile,
+            include_internal_indexes=True,
+        )
+        baseline = agent_contracts.baseline_retrieve_context(
+            self.repo,
+            self.issue_text,
+            search_index=localization.get("_search_index"),
+            max_files=self.max_files,
+        )
+        local_gate = agent_contracts.evaluate_context_quality(
+            localization,
+            baseline,
+            estimate=context_gate_estimate(
+                self.repo,
+                localization,
+                profile,
+                max_candidate_files=self.max_files,
+                max_regions=max(self.top_k, DEFAULT_PHASE1_HYBRID_PRECONTEXT_CANDIDATES),
+            ),
+            model_profile=profile,
+        )
+        return Phase1CandidateBundle(
+            profile=profile,
+            beat_selection=beat_selection,
+            beat_regions=beat_regions,
+            beat_region_trace=beat_region_trace,
+            evidence=evidence,
+            modules=modules,
+            content_idf=content_idf,
+            localization=localization,
+            baseline=baseline,
+            local_gate=local_gate,
+            local_candidates=agent_contracts.context_candidates_by_path(localization.get("file_candidates", [])),
+            beat_candidate_files=list(beat_selection.get("beat_sota1", {}).get("candidate_files", [])),
+        )
+
+
+@dataclasses.dataclass
+class FusionRanker:
+    repo: Path
+    issue_text: str
+    bundle: Phase1CandidateBundle
+    top_k: int
+    line_window: int
+    line_overlap: int
+    regions_per_file: int
+
+    def rank(self) -> list[dict[str, Any]]:
+        return phase1_fuse_and_rank_regions(
+            self.repo,
+            self.issue_text,
+            self.bundle,
+            top_k=self.top_k,
+            line_window=self.line_window,
+            line_overlap=self.line_overlap,
+            regions_per_file=self.regions_per_file,
+        )
+
+
+@dataclasses.dataclass
+class GatePolicy:
+    model_profile: dict[str, Any]
+
+    def decide(self, local_gate: dict[str, Any], fused_regions: list[dict[str, Any]]) -> dict[str, Any]:
+        return phase1_hybrid_gate(local_gate, fused_regions, self.model_profile)
+
+
+@dataclasses.dataclass
+class PromptPolicy:
+    repo: Path
+    issue_text: str
+    selection: dict[str, Any]
+    top_k: int
+    precontext_candidates: int
+    precontext_max_chars: int
+
+    def build(self) -> tuple[str, dict[str, Any]]:
+        return phase1_format_precontext(
+            self.repo,
+            self.issue_text,
+            selection=self.selection,
+            top_k=self.top_k,
+            precontext_candidates=self.precontext_candidates,
+            precontext_max_chars=self.precontext_max_chars,
+        )
+
+    @staticmethod
+    def prompt_strategy(strategy: str, precontext: str | None, precontext_metadata: dict[str, Any] | None) -> str:
+        gate = (precontext_metadata or {}).get("gate", {})
+        if strategy == "codex-phase1-hybrid" and (not precontext or gate.get("decision") in PHASE1_FALLBACK_DECISIONS):
+            return "codex-baseline"
+        return strategy
+
+
+@dataclasses.dataclass
+class BenchmarkAdapter:
+    selection: dict[str, Any]
+    top_k: int
+
+    def regions(self) -> tuple[list[dict[str, int | str]], list[dict[str, Any]]]:
+        hybrid = self.selection.get("phase1_hybrid", {})
+        top_regions = hybrid.get("regions", [])[: self.top_k]
+        regions = [
+            {"path": item["path"], "start": int(item["start"]), "end": int(item["end"])}
+            for item in top_regions
+        ]
+        trace = [
+            {
+                "rank": index,
+                "strategy": "phase1-hybrid",
+                "operation": "region_emit",
+                "path": item["path"],
+                "start": int(item["start"]),
+                "end": int(item["end"]),
+                "score": item.get("score"),
+                "strength": item.get("strength"),
+                "providers": item.get("providers", []),
+                "evidence": item.get("evidence", []),
+            }
+            for index, item in enumerate(top_regions, start=1)
+        ]
+        return regions, trace
 
 
 def split_identifier_text(value: str) -> str:
@@ -2065,6 +2298,838 @@ def sanitized_selection_row(issue_text: str) -> dict[str, Any]:
     return {"task": issue_text, "graph_seed_hints": []}
 
 
+def context_candidate_risk_counts(candidates: list[dict[str, Any]]) -> dict[str, int]:
+    noisy_path_count = 0
+    vendored_noisy_path_count = 0
+    generated_or_minified_count = 0
+    docs_or_config_count = 0
+    for candidate in candidates:
+        flags = set(candidate.get("risk_flags", []))
+        if flags:
+            noisy_path_count += 1
+        if "vendor_generated_static" in flags:
+            vendored_noisy_path_count += 1
+        if flags & {"generated", "generated_or_minified"}:
+            generated_or_minified_count += 1
+        if flags & {"docs", "config"}:
+            docs_or_config_count += 1
+    return {
+        "noisy_path_count": noisy_path_count,
+        "vendored_noisy_path_count": vendored_noisy_path_count,
+        "generated_or_minified_count": generated_or_minified_count,
+        "docs_or_config_count": docs_or_config_count,
+    }
+
+
+def context_gate_estimate(
+    repo: Path,
+    localization: dict[str, Any],
+    profile: dict[str, Any],
+    *,
+    max_candidate_files: int,
+    max_regions: int,
+) -> dict[str, Any]:
+    estimate = agent_contracts.estimate_candidate_bytes(
+        repo,
+        localization.get("file_candidates", [])[:max_candidate_files],
+    )
+    estimate.update(
+        agent_contracts.estimate_preloaded_region_budget(
+            repo,
+            localization.get("regions", []),
+            max_regions=max_regions,
+            max_chars=12_000 if profile.get("name") == "spark" else 24_000,
+            snippet_max_chars=2_400 if profile.get("name") == "spark" else 4_000,
+        )
+    )
+    return estimate
+
+
+def context_localized_context_files(
+    repo: Path,
+    issue_text: str,
+    *,
+    max_files: int,
+    max_bytes: int,
+    top_k: int,
+    line_window: int,
+    model_profile: str | dict[str, Any] | None = "unknown",
+) -> dict[str, Any]:
+    profile = agent_contracts.model_profile_payload(model_profile)
+    localization = agent_contracts.localize_issue_context(
+        repo,
+        issue_text,
+        max_candidate_files=max(max_files * 2, max_files + top_k),
+        max_regions=max(top_k * 4, top_k),
+        line_window=line_window,
+        max_bytes=max_bytes,
+        model_profile=profile,
+        include_internal_indexes=True,
+    )
+    baseline = agent_contracts.baseline_retrieve_context(
+        repo,
+        issue_text,
+        search_index=localization.get("_search_index"),
+        max_files=max_files,
+    )
+    gate = agent_contracts.evaluate_context_quality(
+        localization,
+        baseline,
+        estimate=context_gate_estimate(
+            repo,
+            localization,
+            profile,
+            max_candidate_files=max_files,
+            max_regions=max(top_k, 4),
+        ),
+        model_profile=profile,
+    )
+    all_candidates = localization.get("file_candidates", [])
+    risk_counts = context_candidate_risk_counts(all_candidates)
+    candidate_context_files = [
+        agent_contracts.ContextFile(candidate["path"], candidate.get("role", "source"))
+        for candidate in all_candidates
+    ]
+    limited_files, limit_omissions, selected_bytes = agent_contracts.apply_context_limits(
+        repo,
+        candidate_context_files,
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+    included_paths = {item.path for item in limited_files}
+    candidates = [candidate for candidate in all_candidates if candidate["path"] in included_paths]
+    bounded_localization = dict(localization)
+    bounded_localization["file_candidates"] = candidates
+    bounded_regions = [
+        region
+        for region in localization.get("regions", [])
+        if region.get("path") in included_paths
+    ]
+    omitted_regions: list[dict[str, Any]] = []
+    if gate["decision"] in {"tool_only", "abstain"}:
+        omitted_regions.extend(
+            {
+                "path": region.get("path"),
+                "start": region.get("start"),
+                "end": region.get("end"),
+                "reason": f"gate decision {gate['decision']} does not preload snippets",
+            }
+            for region in bounded_regions
+        )
+        bounded_regions = []
+    else:
+        candidate_by_path = agent_contracts.context_candidates_by_path(all_candidates)
+        primary_source_paths = agent_contracts.spark_primary_source_paths(all_candidates, profile)
+        filtered_regions: list[dict[str, Any]] = []
+        preload_limit = int(gate.get("limits", {}).get("max_preloaded_regions", top_k))
+        for region in bounded_regions:
+            reason = agent_contracts.spark_preload_omission_reason(region, candidate_by_path, profile, primary_source_paths)
+            if reason:
+                omitted_regions.append(
+                    {
+                        "path": region.get("path"),
+                        "start": region.get("start"),
+                        "end": region.get("end"),
+                        "reason": reason,
+                    }
+                )
+                continue
+            if len(filtered_regions) >= preload_limit:
+                omitted_regions.append(
+                    {
+                        "path": region.get("path"),
+                        "start": region.get("start"),
+                        "end": region.get("end"),
+                        "reason": "gate preloaded-region limit",
+                    }
+                )
+                continue
+            filtered_regions.append(region)
+        bounded_regions = filtered_regions
+    bounded_localization["regions"] = bounded_regions
+    trace = [
+        {
+            "rank": index,
+            "strategy": "context-localized",
+            "operation": "file_rank",
+            "path": candidate["path"],
+            "role": candidate.get("role"),
+            "score": candidate.get("score"),
+            "confidence": candidate.get("confidence"),
+            "evidence": candidate.get("evidence", []),
+            "risk_flags": candidate.get("risk_flags", []),
+        }
+        for index, candidate in enumerate(candidates, start=1)
+    ]
+    trace.extend(
+        {
+            "rank": index,
+            "strategy": "context-localized",
+            "operation": "region_rank",
+            "path": region["path"],
+            "start": region["start"],
+            "end": region["end"],
+            "score": region.get("score"),
+            "file_score": region.get("file_score"),
+            "window_score": region.get("window_score"),
+            "strength": region.get("strength"),
+            "evidence": region.get("evidence", []),
+        }
+        for index, region in enumerate(bounded_regions, start=1)
+    )
+    return {
+        "files": [agent_contracts.ContextFile(candidate["path"], candidate.get("role", "source")) for candidate in candidates],
+        "included_files": [candidate["path"] for candidate in candidates],
+        "omitted_files": limit_omissions,
+        "selected_bytes": selected_bytes,
+        "resolved_module": localization.get("module_candidates", [{}])[0].get("name") if localization.get("module_candidates") else None,
+        "trace": trace,
+        "context_localized": {
+            "model_profile": profile,
+            "localization": bounded_localization,
+            "gate": gate,
+            "baseline": baseline,
+            "all_candidate_count": len(all_candidates),
+            "risk_counts": risk_counts,
+            "omitted_regions": omitted_regions,
+        },
+    }
+
+
+def phase1_region_key(region: dict[str, Any]) -> tuple[str, int, int]:
+    return (str(region.get("path", "")), int(region.get("start", 1)), int(region.get("end", 1)))
+
+
+def phase1_candidate_role(path: str, local_candidates: dict[str, dict[str, Any]], evidence: dict[str, EvidenceFile]) -> str:
+    candidate = local_candidates.get(path)
+    if candidate:
+        return str(candidate.get("role") or "source")
+    evidence_file = evidence.get(path)
+    if evidence_file:
+        return evidence_file.role
+    return "source"
+
+
+def phase1_candidate_risk_flags(path: str, role: str, local_candidates: dict[str, dict[str, Any]]) -> list[str]:
+    candidate = local_candidates.get(path)
+    flags = candidate.get("risk_flags") if candidate else None
+    risk_flags = [str(flag) for flag in flags] if isinstance(flags, list) else agent_contracts.context_path_risk_flags(path, role)
+    if beat_sota2_is_noisy_precontext_path(path):
+        risk_flags.append("precontext_noise")
+    return unique_ordered(risk_flags)
+
+
+def phase1_effective_role(role: str, risk_flags: list[str], *, direct: bool) -> str:
+    if direct:
+        return role
+    flags = set(risk_flags)
+    if "config" in flags:
+        return "config"
+    if flags & {"docs", "precontext_noise"}:
+        return "docs"
+    return role
+
+
+def phase1_local_candidate_direct(candidate: dict[str, Any] | None) -> bool:
+    if not candidate:
+        return False
+    evidence_kinds = {item.get("kind") for item in candidate.get("evidence", [])}
+    return bool(evidence_kinds & PHASE1_DIRECT_EVIDENCE_KINDS)
+
+
+def phase1_trace_direct(trace: dict[str, Any] | None) -> bool:
+    if not trace:
+        return False
+    reasons = [str(reason) for reason in trace.get("reasons", [])]
+    return any(reason.startswith(("exact-path:", "traceback-path", "quoted-term:", "symbol:")) for reason in reasons)
+
+
+def phase1_strength_value(strength: str) -> int:
+    return {"strong": 3, "medium": 2, "weak": 1}.get(strength, 0)
+
+
+def phase1_best_strength(left: str, right: str) -> str:
+    return left if phase1_strength_value(left) >= phase1_strength_value(right) else right
+
+
+def phase1_evidence_kinds(evidence: list[dict[str, Any]], reasons: list[str]) -> set[str]:
+    kinds = {str(item.get("kind", "")) for item in evidence if item.get("kind")}
+    for reason in reasons:
+        head = str(reason).split(":", 1)[0]
+        if head:
+            kinds.add(head)
+    return kinds
+
+
+def phase1_regions_overlap_or_near(left: dict[str, Any], right: dict[str, Any]) -> tuple[bool, bool]:
+    left_start = int(left.get("start", 1) or 1)
+    left_end = int(left.get("end", left_start) or left_start)
+    right_start = int(right.get("start", 1) or 1)
+    right_end = int(right.get("end", right_start) or right_start)
+    overlap = left_start <= right_end and right_start <= left_end
+    gap = max(left_start - right_end, right_start - left_end, 0)
+    return overlap, gap <= PHASE1_REGION_FUSION_NEARBY_LINES
+
+
+def phase1_region_merge_compatible(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+    *,
+    provider: str,
+    evidence: list[dict[str, Any]],
+    reasons: list[str],
+    direct: bool,
+) -> bool:
+    if str(existing.get("path", "")) != str(incoming.get("path", "")):
+        return False
+    overlap, nearby = phase1_regions_overlap_or_near(existing, incoming)
+    if not nearby:
+        return False
+    existing_providers = set(existing.get("providers", []))
+    existing_direct = bool(existing.get("direct"))
+    existing_kinds = phase1_evidence_kinds(list(existing.get("evidence", [])), list(existing.get("reasons", [])))
+    incoming_kinds = phase1_evidence_kinds(evidence, reasons)
+    has_direct_or_shared_evidence = existing_direct or direct or bool(existing_kinds & incoming_kinds)
+    if provider in existing_providers:
+        return overlap and has_direct_or_shared_evidence
+    if overlap:
+        return has_direct_or_shared_evidence or phase1_strength_value(str(existing.get("strength", "weak"))) >= 2
+    return direct or existing_direct or bool((existing_kinds - PHASE1_BROAD_EVIDENCE_KINDS) & (incoming_kinds - PHASE1_BROAD_EVIDENCE_KINDS))
+
+
+def phase1_matching_fused_key(
+    fused: dict[tuple[str, int, int], dict[str, Any]],
+    region: dict[str, Any],
+    *,
+    provider: str,
+    evidence: list[dict[str, Any]],
+    reasons: list[str],
+    direct: bool,
+) -> tuple[str, int, int] | None:
+    for key, item in fused.items():
+        if phase1_region_merge_compatible(
+            item,
+            region,
+            provider=provider,
+            evidence=evidence,
+            reasons=reasons,
+            direct=direct,
+        ):
+            return key
+    return None
+
+
+def phase1_broad_scent_region(item: dict[str, Any]) -> bool:
+    if bool(item.get("direct")):
+        return False
+    kinds = phase1_evidence_kinds(list(item.get("evidence", [])), list(item.get("reasons", [])))
+    if kinds & PHASE1_DIRECT_EVIDENCE_KINDS:
+        return False
+    role = str(item.get("role", ""))
+    if role in {"test", "docs", "config", "manifest"} or set(item.get("risk_flags", [])) & {"docs", "config", "precontext_noise"}:
+        return True
+    return bool(kinds) and kinds <= PHASE1_BROAD_EVIDENCE_KINDS
+
+
+def phase1_add_fused_region(
+    fused: dict[tuple[str, int, int], dict[str, Any]],
+    region: dict[str, Any],
+    *,
+    provider: str,
+    rank: int,
+    score_hint: int,
+    strength: str,
+    role: str,
+    risk_flags: list[str],
+    evidence: list[dict[str, Any]],
+    reasons: list[str],
+    direct: bool,
+) -> None:
+    key = phase1_region_key(region)
+    path, start, end = key
+    if not path:
+        return
+    effective_role = phase1_effective_role(role, risk_flags, direct=direct)
+    existing_key = phase1_matching_fused_key(
+        fused,
+        {"path": path, "start": start, "end": end},
+        provider=provider,
+        evidence=evidence,
+        reasons=reasons,
+        direct=direct,
+    )
+    if existing_key is not None:
+        item = fused.pop(existing_key)
+        item["start"] = min(int(item.get("start", start)), start)
+        item["end"] = max(int(item.get("end", end)), end)
+    else:
+        item = {
+            "path": path,
+            "start": start,
+            "end": end,
+            "score": 0.0,
+            "providers": [],
+            "provider_ranks": {},
+            "role": effective_role,
+            "strength": strength,
+            "risk_flags": risk_flags,
+            "evidence": [],
+            "reasons": [],
+            "direct": False,
+        }
+    item["providers"] = unique_ordered([*item.get("providers", []), provider])
+    item["provider_ranks"][provider] = rank
+    item["strength"] = phase1_best_strength(str(item.get("strength", "weak")), strength)
+    item["direct"] = bool(item.get("direct")) or direct
+    if effective_role == "source":
+        item["role"] = "source"
+    elif item.get("role") != "source":
+        item["role"] = effective_role
+    item["risk_flags"] = unique_ordered([*item.get("risk_flags", []), *risk_flags])
+    item["evidence"] = [*item.get("evidence", []), *evidence[:8]]
+    item["reasons"] = unique_ordered([*item.get("reasons", []), *reasons[:8]])
+    item["score"] += (10_000.0 / (PHASE1_RRF_K + rank)) + min(260.0, max(0, score_hint) / 18.0)
+    fused[phase1_region_key(item)] = item
+
+
+def phase1_finalize_fused_regions(fused: dict[tuple[str, int, int], dict[str, Any]], *, top_k: int) -> list[dict[str, Any]]:
+    finalized: list[dict[str, Any]] = []
+    for item in fused.values():
+        providers = set(item.get("providers", []))
+        provider_count = len(providers)
+        role = str(item.get("role") or "")
+        risk_flags = set(item.get("risk_flags", []))
+        score = float(item.get("score", 0.0))
+        direct = bool(item.get("direct"))
+        broad_scent = phase1_broad_scent_region(item)
+        if "baseline" in providers:
+            score += 180.0
+            item["reasons"] = unique_ordered([*item.get("reasons", []), "baseline-preserved"])
+        if provider_count > 1:
+            score += 220.0
+            item["reasons"] = unique_ordered([*item.get("reasons", []), "provider-agreement"])
+        if direct:
+            score += 260.0
+        strength = str(item.get("strength", "weak"))
+        score += {"strong": 180.0, "medium": 90.0, "weak": 0.0}.get(strength, 0.0)
+        score += {"source": 70.0, "test": 25.0, "docs": -60.0, "config": -80.0, "manifest": -80.0}.get(role, 0.0)
+        if role == "source" and direct and provider_count > 1 and strength == "strong":
+            score += 360.0
+        elif role == "source" and direct:
+            score += 180.0
+        elif role == "source" and provider_count > 1 and strength == "strong":
+            score += 90.0
+        if role == "test" and not direct:
+            score -= 360.0
+        if role in {"docs", "config", "manifest"} and not direct:
+            score -= 420.0
+        if broad_scent:
+            score -= 240.0
+        if risk_flags & {"vendor_generated_static", "generated", "generated_or_minified"} and not direct:
+            score -= 260.0
+        if risk_flags & {"docs", "config", "precontext_noise"} and not direct:
+            score -= 240.0
+        if risk_flags & {"large_file"} and not direct:
+            score -= 90.0
+        item["score"] = round(score, 3)
+        item["provider_count"] = provider_count
+        item["broad_scent"] = broad_scent
+        finalized.append(item)
+
+    finalized.sort(
+        key=lambda item: (
+            -float(item.get("score", 0.0)),
+            ROLE_PRIORITY.get(str(item.get("role", "")), 9),
+            str(item.get("path", "")),
+            int(item.get("start", 1)),
+            int(item.get("end", 1)),
+        )
+    )
+    selected: list[dict[str, Any]] = []
+    selected_keys: set[tuple[str, int, int]] = set()
+    selected_paths: set[str] = set()
+    for region in finalized:
+        if str(region.get("path", "")) in selected_paths:
+            continue
+        selected.append(region)
+        selected_paths.add(str(region.get("path", "")))
+        selected_keys.add(phase1_region_key(region))
+        if len(selected) >= top_k:
+            break
+    if len(selected) < top_k:
+        for region in finalized:
+            key = phase1_region_key(region)
+            if key in selected_keys:
+                continue
+            selected.append(region)
+            selected_keys.add(key)
+            if len(selected) >= top_k:
+                break
+    return selected
+
+
+def phase1_fuse_and_rank_regions(
+    repo: Path,
+    issue_text: str,
+    bundle: Phase1CandidateBundle,
+    *,
+    top_k: int,
+    line_window: int,
+    line_overlap: int,
+    regions_per_file: int,
+) -> list[dict[str, Any]]:
+    fused: dict[tuple[str, int, int], dict[str, Any]] = {}
+    local_candidates = bundle.local_candidates
+    evidence = bundle.evidence
+    signals = extract_query_signals(issue_text)
+
+    for rank, candidate in enumerate(bundle.baseline.get("candidates", [])[:top_k], start=1):
+        path = str(candidate.get("path", ""))
+        evidence_file = evidence.get(path)
+        if not path or not evidence_file:
+            continue
+        role = phase1_candidate_role(path, local_candidates, evidence)
+        risk_flags = phase1_candidate_risk_flags(path, role, local_candidates)
+        file_score = int(candidate.get("score", 0) or 0) + ROLE_REGION_BASE_SCORE.get(role, 1)
+        region = best_region_for_file(
+            repo,
+            agent_contracts.ContextFile(path, role),
+            file_score,
+            signals.tokens,
+            bundle.modules,
+            line_window=line_window,
+            line_overlap=line_overlap,
+        )
+        if not region:
+            continue
+        evidence_items = [
+            {"kind": "baseline_lexical", "value": str(item.get("value", item.get("kind", "")))}
+            for item in candidate.get("evidence", [])[:6]
+        ]
+        phase1_add_fused_region(
+            fused,
+            {"path": region.path, "start": region.start, "end": region.end},
+            provider="baseline",
+            rank=rank,
+            score_hint=region.score,
+            strength="medium" if file_score >= 350 else "weak",
+            role=role,
+            risk_flags=risk_flags,
+            evidence=evidence_items,
+            reasons=unique_ordered(["baseline-lexical", *region.reasons[:6]]),
+            direct=False,
+        )
+
+    for rank, region in enumerate(bundle.localization.get("regions", []), start=1):
+        path = str(region.get("path", ""))
+        candidate = local_candidates.get(path)
+        role = phase1_candidate_role(path, local_candidates, evidence)
+        risk_flags = phase1_candidate_risk_flags(path, role, local_candidates)
+        evidence_items = list(region.get("evidence", []))
+        phase1_add_fused_region(
+            fused,
+            region,
+            provider="issue_localizer",
+            rank=rank,
+            score_hint=int(region.get("score", 0) or 0),
+            strength=str(region.get("strength", candidate.get("confidence", "weak") if candidate else "weak")),
+            role=role,
+            risk_flags=risk_flags,
+            evidence=evidence_items,
+            reasons=[str(item.get("kind", "")) for item in evidence_items if item.get("kind")],
+            direct=phase1_local_candidate_direct(candidate),
+        )
+
+    beat_trace_by_region = {
+        (item.get("path"), item.get("start"), item.get("end")): item
+        for item in bundle.beat_region_trace
+        if item.get("operation") == "region_rank"
+    }
+    top_beat_score = int(bundle.beat_candidate_files[0].get("score", 0) or 0) if bundle.beat_candidate_files else 0
+    beat_candidate_level_by_path = {
+        str(candidate.get("path", "")): beat_sota2_candidate_level(candidate, top_beat_score)
+        for candidate in bundle.beat_candidate_files
+    }
+    for rank, region in enumerate(bundle.beat_regions, start=1):
+        path = str(region.get("path", ""))
+        trace = beat_trace_by_region.get((region.get("path"), region.get("start"), region.get("end")), {})
+        role = phase1_candidate_role(path, local_candidates, evidence)
+        risk_flags = phase1_candidate_risk_flags(path, role, local_candidates)
+        strength = beat_sota2_region_level(trace, beat_candidate_level_by_path)
+        reasons = [str(reason) for reason in trace.get("reasons", [])]
+        evidence_items = [{"kind": "beat_sota1_reason", "value": reason} for reason in reasons[:8]]
+        if trace.get("matched_tokens"):
+            evidence_items.append({"kind": "information_scent", "value": ",".join(trace.get("matched_tokens", [])[:8])})
+        if evidence.get(path) and getattr(evidence[path], "paired_paths", None):
+            evidence_items.append({"kind": "verification_discoverability", "value": ",".join(sorted(evidence[path].paired_paths)[:4])})
+        phase1_add_fused_region(
+            fused,
+            region,
+            provider="beat_sota1",
+            rank=rank,
+            score_hint=int(trace.get("score", 0) or 0),
+            strength=strength,
+            role=role,
+            risk_flags=risk_flags,
+            evidence=evidence_items,
+            reasons=reasons,
+            direct=phase1_trace_direct(trace),
+        )
+
+    return phase1_finalize_fused_regions(fused, top_k=max(top_k, DEFAULT_PHASE1_HYBRID_PRECONTEXT_CANDIDATES))
+
+
+def phase1_hybrid_gate(local_gate: dict[str, Any], fused_regions: list[dict[str, Any]], model_profile: dict[str, Any]) -> dict[str, Any]:
+    gate = dict(local_gate)
+    reasons = list(gate.get("reasons", []))
+    top = fused_regions[0] if fused_regions else {}
+    top_is_source = top.get("role") == "source"
+    top_provider_count = int(top.get("provider_count", 0) or 0)
+    top_has_agreement = top_provider_count > 1
+    top_has_balanced_agreement = top_provider_count == 2
+    top_is_strong = top.get("strength") == "strong"
+    top_is_risky = bool(set(top.get("risk_flags", [])) & PHASE1_RISK_FLAGS)
+    top_is_direct = bool(top.get("direct"))
+    strict = model_profile.get("name") == "spark" or model_profile.get("anchoring_sensitivity") == "high"
+    if not fused_regions:
+        gate.update(
+            {
+                "decision": "abstain",
+                "confidence": "low",
+                "fallback": "baseline_search",
+                "limits": {"max_preloaded_regions": 0, "max_preloaded_chars": 0},
+                "reasons": unique_ordered([*reasons, "phase1 hybrid produced no fused regions"]),
+            }
+        )
+        return gate
+
+    safe_source = top_is_source and top_is_strong and not top_is_risky
+    hintable_source = top_is_source and not top_is_risky and (top_is_strong or top_is_direct)
+    source_like_regions = [
+        region
+        for region in fused_regions
+        if region.get("role") == "source"
+        and region.get("strength") in {"strong", "medium"}
+        and not (set(region.get("risk_flags", [])) & PHASE1_RISK_FLAGS)
+    ]
+    provider_agreed_source = [
+        region
+        for region in source_like_regions
+        if int(region.get("provider_count", 0) or 0) > 1
+    ]
+    direct_source = [region for region in source_like_regions if region.get("direct")]
+    prior_decision = str(gate.get("decision", "tool_only"))
+    if prior_decision == "inject":
+        reasons.append("phase1 hybrid downgrades inject to advisory snippets to avoid anchoring")
+
+    if strict:
+        if hintable_source and top_has_balanced_agreement and (top_has_agreement or top_is_direct):
+            decision = "advisory_regions"
+            confidence = "medium"
+            limits = {"max_preloaded_regions": 2, "max_preloaded_chars": 0}
+            reasons.append("phase1 strict model receives line hints without snippets")
+        else:
+            decision = "tool_only"
+            confidence = "low"
+            limits = {"max_preloaded_regions": 0, "max_preloaded_chars": 0}
+            reasons.append("phase1 strict model withheld weak or risky fused context")
+    elif safe_source and top_has_balanced_agreement and top_has_agreement and top_is_direct:
+        decision = "advisory_snippets"
+        confidence = "high" if prior_decision == "inject" else "medium"
+        limits = {"max_preloaded_regions": 4, "max_preloaded_chars": 16_000}
+        reasons.append("phase1 balanced provider-agreed direct source evidence allows bounded snippets")
+    elif hintable_source and top_has_balanced_agreement and (top_has_agreement or top_is_direct):
+        decision = "advisory_regions"
+        confidence = "medium"
+        limits = {"max_preloaded_regions": 4, "max_preloaded_chars": 0}
+        reasons.append("phase1 balanced source evidence allows line hints without snippets")
+    elif (
+        model_profile.get("name") == "frontier"
+        and top_is_source
+        and top_has_balanced_agreement
+        and not top_is_risky
+        and (provider_agreed_source or direct_source)
+    ):
+        decision = "advisory_paths"
+        confidence = "low"
+        limits = {"max_preloaded_regions": 0, "max_preloaded_chars": 0}
+        reasons.append("phase1 frontier profile allows provider-backed file-path hints only")
+    elif prior_decision == "abstain":
+        decision = "abstain"
+        confidence = "low"
+        limits = {"max_preloaded_regions": 0, "max_preloaded_chars": 0}
+        reasons.append("phase1 found no safe source-like advisory context")
+    else:
+        decision = "tool_only"
+        confidence = "low"
+        limits = {"max_preloaded_regions": 0, "max_preloaded_chars": 0}
+        reasons.append("phase1 withheld risky non-source fused context")
+
+    gate["decision"] = decision
+    gate["confidence"] = confidence
+    gate["fallback"] = "baseline_search" if decision in PHASE1_FALLBACK_DECISIONS else "progressive_tools"
+    gate["limits"] = limits
+    gate["reasons"] = unique_ordered(reasons)
+    gate["model_profile"] = model_profile
+    gate["metrics"] = {
+        **dict(gate.get("metrics", {})),
+        "top_provider_count": top_provider_count,
+        "top_is_source": top_is_source,
+        "top_is_direct": top_is_direct,
+        "top_is_risky": top_is_risky,
+        "safe_source_region_count": len(source_like_regions),
+        "provider_agreed_source_region_count": len(provider_agreed_source),
+        "direct_source_region_count": len(direct_source),
+    }
+    return gate
+
+
+def phase1_hybrid_context_files(
+    repo: Path,
+    issue_text: str,
+    *,
+    max_files: int,
+    max_bytes: int,
+    top_k: int,
+    line_window: int,
+    line_overlap: int,
+    regions_per_file: int,
+    expansion_rounds: int,
+    ablations: set[str],
+    model_profile: str | dict[str, Any] | None = "mini",
+) -> dict[str, Any]:
+    bundle = CandidateProvider(
+        repo=repo,
+        issue_text=issue_text,
+        max_files=max_files,
+        max_bytes=max_bytes,
+        top_k=top_k,
+        line_window=line_window,
+        line_overlap=line_overlap,
+        regions_per_file=regions_per_file,
+        expansion_rounds=expansion_rounds,
+        ablations=ablations,
+        model_profile=model_profile,
+    ).gather()
+    profile = bundle.profile
+    localization = bundle.localization
+    baseline = bundle.baseline
+    local_gate = bundle.local_gate
+    local_candidates = bundle.local_candidates
+    evidence = bundle.evidence
+    beat_selection = bundle.beat_selection
+    beat_candidate_files = bundle.beat_candidate_files
+    fused_regions = FusionRanker(
+        repo=repo,
+        issue_text=issue_text,
+        bundle=bundle,
+        top_k=top_k,
+        line_window=line_window,
+        line_overlap=line_overlap,
+        regions_per_file=regions_per_file,
+    ).rank()
+    hybrid_gate = GatePolicy(profile).decide(local_gate, fused_regions)
+    candidate_paths = unique_ordered(
+        [
+            *[str(region["path"]) for region in fused_regions],
+            *[str(candidate.get("path", "")) for candidate in baseline.get("candidates", [])[:max_files]],
+            *[str(candidate.get("path", "")) for candidate in localization.get("file_candidates", [])[:max_files]],
+            *[str(candidate.get("path", "")) for candidate in beat_candidate_files[:max_files]],
+        ]
+    )
+    candidate_context_files = [
+        agent_contracts.ContextFile(path, phase1_candidate_role(path, local_candidates, evidence))
+        for path in candidate_paths
+        if path
+    ]
+    limited_files, limit_omissions, selected_bytes = agent_contracts.apply_context_limits(
+        repo,
+        candidate_context_files,
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+    included_paths = {item.path for item in limited_files}
+    bounded_regions = [region for region in fused_regions if region["path"] in included_paths]
+    provider_paths = {
+        "baseline": {str(item.get("path", "")) for item in baseline.get("candidates", [])},
+        "issue_localizer": {str(item.get("path", "")) for item in localization.get("file_candidates", [])},
+        "beat_sota1": {str(item.get("path", "")) for item in beat_candidate_files},
+    }
+    trace: list[dict[str, Any]] = []
+    for index, path in enumerate([item.path for item in limited_files], start=1):
+        candidate = local_candidates.get(path, {})
+        trace.append(
+            {
+                "rank": index,
+                "strategy": "phase1-hybrid",
+                "operation": "file_fusion",
+                "path": path,
+                "role": phase1_candidate_role(path, local_candidates, evidence),
+                "providers": [provider for provider, paths in provider_paths.items() if path in paths],
+                "localizer_score": candidate.get("score"),
+                "risk_flags": phase1_candidate_risk_flags(path, phase1_candidate_role(path, local_candidates, evidence), local_candidates),
+            }
+        )
+    for index, region in enumerate(bounded_regions, start=1):
+        trace.append(
+            {
+                "rank": index,
+                "strategy": "phase1-hybrid",
+                "operation": "region_fusion",
+                "path": region["path"],
+                "start": region["start"],
+                "end": region["end"],
+                "score": region["score"],
+                "role": region.get("role"),
+                "strength": region.get("strength"),
+                "providers": region.get("providers", []),
+                "provider_ranks": region.get("provider_ranks", {}),
+                "evidence": region.get("evidence", []),
+                "reasons": region.get("reasons", []),
+                "risk_flags": region.get("risk_flags", []),
+            }
+        )
+    return {
+        "files": limited_files,
+        "included_files": [item.path for item in limited_files],
+        "omitted_files": limit_omissions,
+        "selected_bytes": selected_bytes,
+        "resolved_module": localization.get("module_candidates", [{}])[0].get("name") if localization.get("module_candidates") else beat_selection.get("resolved_module"),
+        "trace": trace,
+        "phase1_hybrid": {
+            "model_profile": profile,
+            "signals": localization.get("signals"),
+            "localizer_confidence": localization.get("confidence"),
+            "localizer_gate": local_gate,
+            "gate": hybrid_gate,
+            "exposure_level": hybrid_gate.get("decision"),
+            "baseline": baseline,
+            "regions": bounded_regions,
+            "all_fused_region_count": len(fused_regions),
+            "candidate_files": [
+                {
+                    "path": item.path,
+                    "role": item.role,
+                }
+                for item in limited_files
+            ],
+            "providers": PHASE1_PROVIDER_SET,
+        },
+        "beat_sota1": beat_selection.get("beat_sota1", {}),
+        "context_localized": {
+            "localization": {
+                key: value
+                for key, value in localization.items()
+                if not key.startswith("_")
+            },
+            "gate": local_gate,
+            "baseline": baseline,
+            "all_candidate_count": len(localization.get("file_candidates", [])),
+            "risk_counts": context_candidate_risk_counts(localization.get("file_candidates", [])),
+        },
+    }
+
+
 def select_context(
     repo: Path,
     issue_text: str,
@@ -2078,7 +3143,32 @@ def select_context(
     beat_sota1_regions_per_file: int,
     beat_sota1_expansion_rounds: int,
     ablations: set[str],
+    model_profile: str | dict[str, Any] | None = "unknown",
 ) -> dict[str, Any]:
+    if strategy == "phase1-hybrid":
+        return phase1_hybrid_context_files(
+            repo,
+            issue_text,
+            max_files=max_files,
+            max_bytes=max_bytes,
+            top_k=top_k,
+            line_window=line_window,
+            line_overlap=line_overlap,
+            regions_per_file=beat_sota1_regions_per_file,
+            expansion_rounds=beat_sota1_expansion_rounds,
+            ablations=ablations,
+            model_profile=model_profile,
+        )
+    if strategy == "context-localized":
+        return context_localized_context_files(
+            repo,
+            issue_text,
+            max_files=max_files,
+            max_bytes=max_bytes,
+            top_k=top_k,
+            line_window=line_window,
+            model_profile=model_profile,
+        )
     if strategy == "beat-sota1":
         return beat_sota1_context_files(
             repo,
@@ -2181,8 +3271,8 @@ def append_jsonl_row(output_path: Path, row: dict[str, Any]) -> None:
         handle.flush()
 
 
-def load_swe_evaluator(bench_path: Path) -> type[Any]:
-    eval_path = bench_path.parent / "eval.py"
+def load_swe_evaluator(eval_bench_path: Path) -> type[Any]:
+    eval_path = eval_bench_path.parent / "eval.py"
     if not eval_path.is_file():
         raise RuntimeError(f"SWE-Explore eval.py not found next to bench: {eval_path}")
     module = types.ModuleType("swe_explore_eval")
@@ -2245,8 +3335,10 @@ def add_metrics(
     records: list[dict[str, Any]],
     repos_root: Path,
     output_rows: list[dict[str, Any]],
+    *,
+    eval_bench_path: Path | None = None,
 ) -> dict[str, float]:
-    evaluator_cls = load_swe_evaluator(bench_path)
+    evaluator_cls = load_swe_evaluator((eval_bench_path or bench_path).resolve())
     file_line_counts = build_file_line_counts(records, repos_root, output_rows)
     evaluator = evaluator_cls(bench_path, file_line_counts=file_line_counts)
     record_by_id = {record["instance_id"]: record for record in records}
@@ -2285,7 +3377,9 @@ def build_output_row(
     beat_sota1_regions_per_file: int,
     beat_sota1_expansion_rounds: int,
     ablations: set[str],
+    model_profile: str | dict[str, Any] | None = "unknown",
 ) -> dict[str, Any]:
+    profile = agent_contracts.model_profile_payload(model_profile)
     selection = select_context(
         repo,
         issue_text,
@@ -2294,10 +3388,11 @@ def build_output_row(
         max_bytes=max_bytes,
         top_k=top_k,
         line_window=line_window,
-        line_overlap=line_overlap,
+        line_overlap=0,
         beat_sota1_regions_per_file=beat_sota1_regions_per_file,
         beat_sota1_expansion_rounds=beat_sota1_expansion_rounds,
         ablations=ablations,
+        model_profile=profile,
     )
     if strategy == "beat-sota1":
         regions, region_trace = selection_to_regions_beat_sota1(
@@ -2309,6 +3404,29 @@ def build_output_row(
             line_overlap=line_overlap,
             regions_per_file=beat_sota1_regions_per_file,
         )
+    elif strategy == "phase1-hybrid":
+        regions, region_trace = BenchmarkAdapter(selection, top_k).regions()
+    elif strategy == "context-localized":
+        localized = selection.get("context_localized", {}).get("localization", {})
+        top_regions = localized.get("regions", [])[:top_k]
+        regions = [
+            {"path": item["path"], "start": int(item["start"]), "end": int(item["end"])}
+            for item in top_regions
+        ]
+        region_trace = [
+            {
+                "rank": index,
+                "strategy": "context-localized",
+                "operation": "region_emit",
+                "path": item["path"],
+                "start": int(item["start"]),
+                "end": int(item["end"]),
+                "score": item.get("score"),
+                "strength": item.get("strength"),
+                "evidence": item.get("evidence", []),
+            }
+            for index, item in enumerate(top_regions, start=1)
+        ]
     else:
         regions, region_trace = selection_to_regions(
             repo,
@@ -2323,6 +3441,7 @@ def build_output_row(
         "included_files": selection.get("included_files", []),
         "omitted_files": selection.get("omitted_files", []),
         "selected_bytes": selection.get("selected_bytes", 0),
+        "model_profile": profile,
         "limits": {
             "top_k": top_k,
             "max_files": max_files,
@@ -2343,6 +3462,40 @@ def build_output_row(
     }
     if "beat_sota1" in selection:
         metadata["beat_sota1"] = selection["beat_sota1"]
+    if "phase1_hybrid" in selection:
+        metadata["phase1_hybrid"] = {
+            "model_profile": selection["phase1_hybrid"].get("model_profile", profile),
+            "signals": selection["phase1_hybrid"].get("signals"),
+            "localizer_confidence": selection["phase1_hybrid"].get("localizer_confidence"),
+            "gate": selection["phase1_hybrid"].get("gate"),
+            "localizer_gate": selection["phase1_hybrid"].get("localizer_gate"),
+            "all_fused_region_count": selection["phase1_hybrid"].get("all_fused_region_count"),
+            "providers": selection["phase1_hybrid"].get("providers", []),
+            "regions": [
+                {
+                    "path": item.get("path"),
+                    "start": item.get("start"),
+                    "end": item.get("end"),
+                    "score": item.get("score"),
+                    "strength": item.get("strength"),
+                    "providers": item.get("providers", []),
+                    "provider_count": item.get("provider_count"),
+                }
+                for item in selection["phase1_hybrid"].get("regions", [])[: max(top_k, DEFAULT_PHASE1_HYBRID_PRECONTEXT_CANDIDATES)]
+            ],
+        }
+    if "context_localized" in selection:
+        localized_candidates = selection["context_localized"]["localization"].get("file_candidates", [])
+        risk_counts = selection["context_localized"].get("risk_counts") or context_candidate_risk_counts(localized_candidates)
+        metadata["context_localized"] = {
+            "model_profile": selection["context_localized"].get("model_profile", profile),
+            "confidence": selection["context_localized"]["localization"].get("confidence"),
+            "gate": selection["context_localized"].get("gate"),
+            "signals": selection["context_localized"]["localization"].get("signals"),
+            "candidate_count": selection["context_localized"].get("all_candidate_count", len(localized_candidates)),
+            "region_count": len(selection["context_localized"]["localization"].get("regions", [])),
+            **risk_counts,
+        }
     return {
         "instance_id": record["instance_id"],
         "explorer": f"agent-contracts:{strategy}",
@@ -2421,6 +3574,105 @@ def build_agent_contracts_precontext(
         snippet = snippet_for_region(repo, region)
         if snippet:
             lines.extend(["```", snippet, "```"])
+    return "\n".join(lines), metadata
+
+
+def build_context_localized_precontext(
+    repo: Path,
+    issue_text: str,
+    *,
+    top_k: int,
+    max_files: int,
+    max_bytes: int,
+    line_window: int,
+    precontext_candidates: int,
+    precontext_max_chars: int,
+    model_profile: str | dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    profile = agent_contracts.model_profile_payload(model_profile)
+    selection = select_context(
+        repo,
+        issue_text,
+        "context-localized",
+        max_files=max_files,
+        max_bytes=max_bytes,
+        top_k=top_k,
+        line_window=line_window,
+        line_overlap=0,
+        beat_sota1_regions_per_file=DEFAULT_BEAT_SOTA1_REGIONS_PER_FILE,
+        beat_sota1_expansion_rounds=DEFAULT_BEAT_SOTA1_EXPANSION_ROUNDS,
+        ablations=set(),
+        model_profile=profile,
+    )
+    localized = selection.get("context_localized", {})
+    localization = localized.get("localization", {})
+    gate = localized.get("gate", {})
+    regions = [
+        {"path": item["path"], "start": int(item["start"]), "end": int(item["end"])}
+        for item in localization.get("regions", [])[:precontext_candidates]
+    ]
+    preloaded_files = list(dict.fromkeys(region["path"] for region in regions))
+    risk_counts = localized.get("risk_counts") or context_candidate_risk_counts(localization.get("file_candidates", []))
+    metadata = {
+        "strategy": "context-localized",
+        "model_profile": profile,
+        "included_files": selection.get("included_files", []),
+        "preloaded_files": preloaded_files,
+        "selected_bytes": selection.get("selected_bytes", 0),
+        "regions": regions,
+        "omitted_regions": localized.get("omitted_regions", []),
+        "gate": gate,
+        "confidence": localization.get("confidence"),
+        "signals": localization.get("signals"),
+        "candidate_count": localized.get("all_candidate_count", len(localization.get("file_candidates", []))),
+        "region_count": len(localization.get("regions", [])),
+        "risk_counts": risk_counts,
+        "trace": selection.get("trace", []),
+    }
+
+    decision = gate.get("decision", "unknown")
+    confidence = gate.get("confidence", localization.get("confidence", "unknown"))
+    lines = [
+        "## context-localized Agent Contracts evidence",
+        "",
+        "This context is advisory. Form an independent hypothesis from the issue and repository before relying on these hints.",
+        "",
+        f"Model profile: {profile['name']}",
+        f"Gate decision: {decision}",
+        f"Gate confidence: {confidence}",
+        f"Fallback: {gate.get('fallback', 'unknown')}",
+        f"Selected bytes: {selection.get('selected_bytes', 0)}",
+        f"Noisy path count: {risk_counts.get('noisy_path_count', 0)}",
+        f"Vendored/noisy path count: {risk_counts.get('vendored_noisy_path_count', 0)}",
+        "",
+    ]
+    if decision in {"tool_only", "abstain"} or not regions:
+        lines.extend(
+            [
+                "No file names or snippets are preloaded for this gate decision.",
+                "Use repository tools directly and treat Agent Contracts as an audit trail only.",
+            ]
+        )
+        return "\n".join(lines), metadata
+
+    lines.extend(
+        [
+            "Selected files:",
+            *[f"- {path}" for path in preloaded_files[:max_files]],
+            "",
+        ]
+    )
+    lines.append("Selected line regions:")
+    used_chars = len("\n".join(lines))
+    for index, region in enumerate(regions, start=1):
+        header = f"{index}. {region['path']}:{region['start']}-{region['end']}"
+        snippet = snippet_for_region(repo, region, max_chars=2_400 if profile["name"] == "spark" else 4_000)
+        block = "\n".join([header, "```", snippet, "```", ""])
+        if used_chars + len(block) > precontext_max_chars:
+            lines.append("[localized snippets truncated by precontext budget]")
+            break
+        lines.append(block)
+        used_chars += len(block)
     return "\n".join(lines), metadata
 
 
@@ -2506,6 +3758,8 @@ def beat_sota2_is_noisy_precontext_path(path: str) -> bool:
     path_obj = Path(path)
     lowered_parts = {part.lower() for part in path_obj.parts}
     lowered_name = path_obj.name.lower()
+    if agent_contracts.context_path_risk_flags(path):
+        return True
     if lowered_name in SOTA2_NOISY_PRECONTEXT_NAMES:
         return True
     if MINIFIED_RE.search(path) or "jquery" in lowered_name:
@@ -2753,6 +4007,171 @@ def build_beat_sota2_precontext(
     return "\n".join(lines), metadata
 
 
+def phase1_format_precontext(
+    repo: Path,
+    issue_text: str,
+    *,
+    selection: dict[str, Any],
+    top_k: int,
+    precontext_candidates: int,
+    precontext_max_chars: int,
+) -> tuple[str, dict[str, Any]]:
+    hybrid = selection.get("phase1_hybrid", {})
+    gate = hybrid.get("gate", {})
+    decision = str(gate.get("decision", "tool_only"))
+    requested_candidates = min(precontext_candidates, DEFAULT_PHASE1_HYBRID_PRECONTEXT_CANDIDATES)
+    requested_chars = min(precontext_max_chars, DEFAULT_PHASE1_HYBRID_PRECONTEXT_MAX_CHARS)
+    gate_limit = int(gate.get("limits", {}).get("max_preloaded_regions", requested_candidates) or 0)
+    preload_limit = min(requested_candidates, gate_limit)
+    all_regions = list(hybrid.get("regions", []))
+    source_paths = unique_ordered(
+        [
+            str(region.get("path", ""))
+            for region in all_regions
+            if region.get("role") == "source" and not (set(region.get("risk_flags", [])) & PHASE1_RISK_FLAGS)
+        ]
+    )
+    candidate_paths = unique_ordered(
+        [
+            *source_paths,
+            *[
+                str(candidate.get("path", ""))
+                for candidate in hybrid.get("candidate_files", [])
+                if candidate.get("role") == "source"
+            ],
+        ]
+    )[:requested_candidates]
+    selected_regions = all_regions[:preload_limit] if decision in {"advisory_regions", "advisory_snippets"} else []
+    metadata = {
+        "strategy": "phase1-hybrid",
+        "exposure_level": decision,
+        "model_profile": hybrid.get("model_profile"),
+        "included_files": selection.get("included_files", []),
+        "selected_bytes": selection.get("selected_bytes", 0),
+        "candidate_paths": candidate_paths,
+        "regions": [
+            {
+                "path": region.get("path"),
+                "start": region.get("start"),
+                "end": region.get("end"),
+                "score": region.get("score"),
+                "strength": region.get("strength"),
+                "providers": region.get("providers", []),
+                "provider_count": region.get("provider_count"),
+                "risk_flags": region.get("risk_flags", []),
+            }
+            for region in selected_regions
+        ],
+        "omitted_regions": [
+            {
+                "path": region.get("path"),
+                "start": region.get("start"),
+                "end": region.get("end"),
+                "reason": "phase1 hybrid gate or precontext limit",
+            }
+            for region in all_regions[preload_limit:]
+        ],
+        "gate": gate,
+        "localizer_gate": hybrid.get("localizer_gate"),
+        "localizer_confidence": hybrid.get("localizer_confidence"),
+        "providers": hybrid.get("providers", []),
+        "trace": selection.get("trace", []),
+    }
+
+    if decision in PHASE1_FALLBACK_DECISIONS:
+        metadata["regions"] = []
+        metadata["candidate_paths"] = []
+        return "", metadata
+
+    lines = [
+        "## Phase 1 hybrid advisory evidence",
+        "",
+        "This context is advisory, not authoritative. Form an independent hypothesis from the issue and repository, then use these fused candidates as evidence to verify or revise it.",
+        "",
+        f"Gate decision: {gate.get('decision', 'unknown')}",
+        f"Gate confidence: {gate.get('confidence', 'unknown')}",
+        f"Exposure level: {decision}",
+        f"Fallback: {gate.get('fallback', 'unknown')}",
+        f"Provider set: {', '.join(hybrid.get('providers', []))}",
+        f"Selected bytes: {selection.get('selected_bytes', 0)}",
+        "",
+    ]
+    if decision == "advisory_paths":
+        if not candidate_paths:
+            metadata["regions"] = []
+            return "", metadata
+        lines.append("Possible files:")
+        for index, path in enumerate(candidate_paths, start=1):
+            lines.append(f"{index}. {path}")
+        return "\n".join(lines), metadata
+
+    if not selected_regions:
+        metadata["regions"] = []
+        return "", metadata
+
+    lines.append("Fused candidate regions:")
+    used_chars = len("\n".join(lines))
+    for index, region in enumerate(selected_regions, start=1):
+        provider_text = ",".join(str(provider) for provider in region.get("providers", []))
+        evidence_text = ",".join(str(reason) for reason in region.get("reasons", [])[:5])
+        header = (
+            f"{index}. {region['path']}:{region['start']}-{region['end']} "
+            f"strength={region.get('strength', 'unknown')} providers={provider_text} "
+            f"score={region.get('score', 'n/a')} evidence={evidence_text}"
+        )
+        if decision == "advisory_regions":
+            lines.append(header)
+            continue
+        snippet = snippet_for_region(repo, region, max_chars=1_800)
+        block = "\n".join([header, "```", snippet, "```", ""])
+        if used_chars + len(block) > requested_chars:
+            lines.append("[phase1 hybrid snippets truncated by precontext budget]")
+            break
+        lines.append(block)
+        used_chars += len(block)
+    return "\n".join(lines), metadata
+
+
+def build_phase1_hybrid_precontext(
+    repo: Path,
+    issue_text: str,
+    *,
+    top_k: int,
+    max_files: int,
+    max_bytes: int,
+    line_window: int,
+    line_overlap: int,
+    regions_per_file: int,
+    expansion_rounds: int,
+    precontext_candidates: int,
+    precontext_max_chars: int,
+    ablations: set[str],
+    model_profile: str | dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    selection = select_context(
+        repo,
+        issue_text,
+        "phase1-hybrid",
+        max_files=max_files,
+        max_bytes=max_bytes,
+        top_k=top_k,
+        line_window=line_window,
+        line_overlap=line_overlap,
+        beat_sota1_regions_per_file=regions_per_file,
+        beat_sota1_expansion_rounds=expansion_rounds,
+        ablations=ablations,
+        model_profile=model_profile,
+    )
+    return PromptPolicy(
+        repo=repo,
+        issue_text=issue_text,
+        selection=selection,
+        top_k=top_k,
+        precontext_candidates=precontext_candidates,
+        precontext_max_chars=precontext_max_chars,
+    ).build()
+
+
 def build_codex_prompt(
     *,
     instance_id: str,
@@ -2770,11 +4189,21 @@ def build_codex_prompt(
                 "Use the following beatSOTA1 scored candidates as the primary evidence set. "
                 "Prefer reranking or narrowing these regions; replace a region only when repository evidence points elsewhere."
             )
+        elif strategy == "codex-context-localized":
+            guidance = (
+                "Use the following context-localized Agent Contracts evidence only after forming independent hypotheses "
+                "from the issue and repository. Respect tool-only or abstain gates by inspecting the repository directly."
+            )
         elif strategy == "codex-beat-sota2":
             guidance = (
                 "Use the following beatSOTA2 advisory evidence only after forming independent hypotheses from the issue "
                 "and repository. Treat weak candidates as possible retrieval noise, and prefer repository evidence over "
                 "the precontext whenever they disagree."
+            )
+        elif strategy == "codex-phase1-hybrid":
+            guidance = (
+                "Use the following Phase 1 hybrid advisory evidence only after forming independent hypotheses from the issue "
+                "and repository. Provider agreement is useful evidence, but direct repository evidence wins over every hint."
             )
         precontext_block = (
             f"\n{guidance}\n\n"
@@ -2809,7 +4238,7 @@ def format_codex_command(template: str, *, repo: Path, response_file: Path, inst
         "response_file": response_file.as_posix(),
         "instance_id": instance_id,
     }
-    return shlex.split(template.format(**values))
+    return [token.format(**values) for token in shlex.split(template)]
 
 
 def decode_first_json(value: str) -> Any:
@@ -2897,13 +4326,15 @@ def run_codex_explorer(
     beat_sota1_precontext_candidates: int,
     beat_sota1_precontext_max_chars: int,
     ablations: set[str],
+    model_profile: str | dict[str, Any] | None = "unknown",
 ) -> dict[str, Any]:
-    if strategy in {"codex-beat-sota1", "codex-beat-sota2"} and "no-codex" in ablations:
+    profile = agent_contracts.model_profile_payload(model_profile)
+    if strategy in {"codex-beat-sota1", "codex-beat-sota2", "codex-phase1-hybrid"} and "no-codex" in ablations:
         row = build_output_row(
             record,
             issue_text,
             repo,
-            "beat-sota1",
+            "phase1-hybrid" if strategy == "codex-phase1-hybrid" else "beat-sota1",
             top_k=top_k,
             max_files=max_files,
             max_bytes=max_bytes,
@@ -2912,6 +4343,7 @@ def run_codex_explorer(
             beat_sota1_regions_per_file=beat_sota1_regions_per_file,
             beat_sota1_expansion_rounds=beat_sota1_expansion_rounds,
             ablations=ablations,
+            model_profile=profile,
         )
         row["explorer"] = f"agent-contracts:{strategy}"
         row["metadata"]["condition"] = strategy
@@ -2930,6 +4362,18 @@ def run_codex_explorer(
             max_bytes=max_bytes,
             line_window=line_window,
             line_overlap=line_overlap,
+        )
+    elif strategy == "codex-context-localized":
+        precontext, precontext_metadata = build_context_localized_precontext(
+            repo,
+            issue_text,
+            top_k=top_k,
+            max_files=max_files,
+            max_bytes=max_bytes,
+            line_window=line_window,
+            precontext_candidates=beat_sota1_precontext_candidates,
+            precontext_max_chars=beat_sota1_precontext_max_chars,
+            model_profile=profile,
         )
     elif strategy == "codex-beat-sota1":
         precontext, precontext_metadata = build_beat_sota1_precontext(
@@ -2961,12 +4405,29 @@ def run_codex_explorer(
             precontext_max_chars=beat_sota1_precontext_max_chars,
             ablations=ablations,
         )
+    elif strategy == "codex-phase1-hybrid":
+        precontext, precontext_metadata = build_phase1_hybrid_precontext(
+            repo,
+            issue_text,
+            top_k=top_k,
+            max_files=max_files,
+            max_bytes=max_bytes,
+            line_window=line_window,
+            line_overlap=line_overlap,
+            regions_per_file=beat_sota1_regions_per_file,
+            expansion_rounds=beat_sota1_expansion_rounds,
+            precontext_candidates=beat_sota1_precontext_candidates,
+            precontext_max_chars=beat_sota1_precontext_max_chars,
+            ablations=ablations,
+            model_profile=profile,
+        )
 
     instance_id = str(record["instance_id"])
+    prompt_strategy = PromptPolicy.prompt_strategy(strategy, precontext, precontext_metadata)
     prompt = build_codex_prompt(
         instance_id=instance_id,
         issue_text=issue_text,
-        strategy=strategy,
+        strategy=prompt_strategy,
         top_k=top_k,
         line_window=line_window,
         precontext=precontext,
@@ -3003,8 +4464,10 @@ def run_codex_explorer(
 
     metadata = {
         "condition": strategy,
+        "model_profile": profile,
         "codex_command": codex_command,
         "codex_returncode": completed.returncode if completed is not None else None,
+        "prompt_strategy": prompt_strategy,
         "runner_error": runner_error,
         "limits": {
             "top_k": top_k,
@@ -3028,6 +4491,11 @@ def run_codex_explorer(
                 else []
             ),
             *(
+                ["context_localized_precontext"]
+                if strategy == "codex-context-localized"
+                else []
+            ),
+            *(
                 ["beat_sota1_precontext"]
                 if strategy == "codex-beat-sota1"
                 else []
@@ -3035,6 +4503,11 @@ def run_codex_explorer(
             *(
                 ["beat_sota2_precontext"]
                 if strategy == "codex-beat-sota2" and precontext
+                else []
+            ),
+            *(
+                ["phase1_hybrid_precontext"]
+                if strategy == "codex-phase1-hybrid" and precontext
                 else []
             ),
         ],
@@ -3098,6 +4571,7 @@ def run(args: argparse.Namespace) -> int:
                 beat_sota1_precontext_candidates=args.beat_sota1_precontext_candidates,
                 beat_sota1_precontext_max_chars=args.beat_sota1_precontext_max_chars,
                 ablations=set(args.ablation or []),
+                model_profile=args.model_profile,
             )
             if args.evaluate:
                 output_rows.append(row)
@@ -3118,6 +4592,7 @@ def run(args: argparse.Namespace) -> int:
             beat_sota1_regions_per_file=args.beat_sota1_regions_per_file,
             beat_sota1_expansion_rounds=args.beat_sota1_expansion_rounds,
             ablations=set(args.ablation or []),
+            model_profile=args.model_profile,
         )
         if args.evaluate:
             output_rows.append(row)
@@ -3127,7 +4602,13 @@ def run(args: argparse.Namespace) -> int:
 
     aggregate_metrics = None
     if args.evaluate and output_rows:
-        aggregate_metrics = add_metrics(bench_path, records, repos_root, output_rows)
+        aggregate_metrics = add_metrics(
+            bench_path,
+            records,
+            repos_root,
+            output_rows,
+            eval_bench_path=args.eval_bench.resolve() if args.eval_bench else None,
+        )
 
     if args.evaluate:
         mode = "a" if args.resume else "w"
@@ -3141,6 +4622,7 @@ def run(args: argparse.Namespace) -> int:
             {
                 "output": output_path.as_posix(),
                 "strategy": args.strategy,
+                "model_profile": args.model_profile,
                 "written": written,
                 "resumed": len(completed),
                 "skipped_missing_repo": skipped_missing_repo,
@@ -3164,6 +4646,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--strategy", choices=STRATEGIES, default="contract-ranked")
     parser.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES)
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    parser.add_argument("--model-profile", choices=agent_contracts.MODEL_PROFILE_NAMES, default="unknown")
     parser.add_argument("--line-window", type=int, default=80)
     parser.add_argument("--line-overlap", type=int, default=20)
     parser.add_argument("--beat-sota1-regions-per-file", type=int, default=DEFAULT_BEAT_SOTA1_REGIONS_PER_FILE)
@@ -3174,6 +4657,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--resume", action="store_true", help="Append only instances not already present in output.")
     parser.add_argument("--evaluate", action="store_true", help="Attach metrics using SWE-Explore eval.py if available.")
+    parser.add_argument(
+        "--eval-bench",
+        type=Path,
+        help="Benchmark path whose directory contains SWE-Explore eval.py; defaults to --bench.",
+    )
     parser.add_argument(
         "--codex-command",
         default=DEFAULT_CODEX_COMMAND,

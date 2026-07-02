@@ -7,6 +7,15 @@ __pycache__/
 
 /.context/
 /benchmark-results/
+/swe-quick-eval/
+/swe-eval/
+/swe-explore-run/
+/SWE-Explore-Bench/
+/SWE-Bench/
+/SWE-bench/
+/swe-bench/
+/swebench/
+/generated-patches/
 /docs/
 /examples/generated/
 

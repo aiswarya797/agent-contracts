@@ -167,11 +167,16 @@ def run_subprocess_repair(command_template: str, repo: Path, payload: dict[str, 
 def normalize_repair_result(raw: dict[str, Any]) -> dict[str, Any]:
     commands = raw.get("commands_run")
     files_edited = raw.get("files_edited")
+    patch = str(raw.get("patch", "") or "")
+    normalized_files_edited = files_edited if isinstance(files_edited, list) else []
     return {
         "resolved": bool(raw.get("resolved")),
-        "patch": str(raw.get("patch", "") or ""),
+        "patch": patch,
+        "patch_bytes": len(patch.encode("utf-8")),
+        "patch_lines": len(patch.splitlines()),
         "commands_run": commands if isinstance(commands, list) else [],
-        "files_edited": files_edited if isinstance(files_edited, list) else [],
+        "files_edited": normalized_files_edited,
+        "files_edited_count": len(normalized_files_edited),
         "notes": str(raw.get("notes", "") or ""),
         "failure_reason": str(raw.get("failure_reason", "") or ""),
         "returncode": raw.get("returncode"),

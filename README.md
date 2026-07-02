@@ -156,7 +156,19 @@ agent-contracts context-pack billing --repo .
 
 Context packs include relevant contracts, instructions, owned source files, tests, and direct dependency contract summaries when present.
 
-Progressive context commands reuse a local module-map cache. In git repositories it is stored under git-private storage at `.git/agent-contracts/cache/`; outside git it falls back to `.agent-contracts/cache/`. The cache is invalidated from a lightweight fingerprint of relevant file paths, sizes, mtimes, roles, and languages, so `context-discover` can warm module detection for later `context-read` and `context-pack` calls without forcing a full import/public-surface parse each time. Set `AGENT_CONTRACTS_DISABLE_CACHE=1` to force a fresh module map.
+For issue-specific work, use the v2 localized flow before building a pack:
+
+```bash
+agent-contracts context-intent "fix payment status renewal handling"
+agent-contracts context-localize "fix src/billing/api.py payment_status renewal handling" --repo .
+agent-contracts context-read-region src/billing/api.py 20 60 --repo .
+agent-contracts context-gate "fix src/billing/api.py payment_status renewal handling" --repo . --model-profile spark
+agent-contracts context-pack-v2 "fix src/billing/api.py payment_status renewal handling" --repo . --model-profile spark
+```
+
+The v2 pack localizes task evidence to ranked files and line windows, compares it against baseline lexical retrieval, and emits `inject`, `advisory`, `tool_only`, or `abstain` gate decisions. Advisory packs tell agents to form an independent hypothesis before trusting localized evidence.
+
+Progressive context commands reuse local caches. In git repositories they are stored under git-private storage at `.git/agent-contracts/cache/`; outside git they fall back to `.agent-contracts/cache/`. The module-map cache warms module detection for later `context-read` and `context-pack` calls. The v2 localized flow also caches search, symbol, and test indexes, so repeated `context-localize`, `context-read-region`, `context-expand`, `context-gate`, and `context-pack-v2` calls do not rebuild the same expensive repo indexes when files have not changed. Cache fingerprints include file paths, sizes, mtimes, roles, languages, schema versions, and algorithm versions. Set `AGENT_CONTRACTS_DISABLE_CACHE=1` to force fresh module maps and localization indexes.
 
 ### MCP Adapter
 
@@ -166,7 +178,7 @@ The package also ships a thin MCP stdio server:
 agent-contracts-mcp
 ```
 
-It exposes `context_discover`, `context_read`, `context_pack`, and `context_verify` as adapters over the same local analyzer and shared context-pack planning path. The intended flow is `context_discover` -> `context_read` -> `context_pack`; there is no whole-repository read tool.
+It exposes `context_discover`, `context_read`, `context_pack`, `context_verify`, and the v2 primitives `context_intent`, `context_localize`, `context_read_region`, `context_expand`, `context_gate`, `context_pack_v2`, and `context_explain` as adapters over the same local analyzer. The legacy intended flow is `context_discover` -> `context_read` -> `context_pack`; the issue-localized flow is `context_intent` -> `context_localize` -> `context_read_region` or `context_expand` -> `context_gate` -> `context_pack_v2`. There is no whole-repository read tool.
 
 ### 3. Verify Phase 1 Context Selection
 
@@ -231,7 +243,7 @@ python scripts/swe_explore_agent_contracts.py \
   --output /tmp/swe-explore-run/SWE-Explore-Bench/results/agent_contracts_contract_ranked/top5.jsonl
 ```
 
-Supported adapter strategies are `module`, `graph-like`, `progressive-mcp`, `contract-ranked`, and `beat-sota1`. The `contract-ranked` strategy resolves the best module, scores files with path, basename, public-surface, local contract, import/dependency, and test evidence, then ranks bounded line windows rather than emitting full-file regions.
+Supported adapter strategies are `module`, `graph-like`, `progressive-mcp`, `contract-ranked`, `context-localized`, and `beat-sota1`. The `contract-ranked` strategy resolves the best module, scores files with path, basename, public-surface, local contract, import/dependency, and test evidence, then ranks bounded line windows rather than emitting full-file regions. The `context-localized` strategy uses the issue-localized v2 localizer and includes no-harm gate metadata while preserving the same ranked-region output shape.
 
 The `beat-sota1` strategy is the research path toward stronger SWE-Explore results. It builds a hybrid evidence index from issue text, paths, symbols, imports, source/test pairs, module contracts, local graph evidence, global code/test retrieval, and line-window scoring. When `scikit-learn` is available, it also adds a TF-IDF chunk retriever matching SWE-Explore's 80-line / 20-overlap baseline shape; otherwise it falls back to dependency-free retrieval. Use `--ablation no-contracts`, `--ablation no-graph`, `--ablation no-symbols`, `--ablation no-tests`, or `--ablation no-active` to measure which evidence source is actually helping.
 
@@ -294,7 +306,7 @@ python scripts/swe_explore_agent_contracts.py \
   --output /tmp/swe-explore-run/SWE-Explore-Bench/results/codex_beat_sota2/top5.jsonl
 ```
 
-`codex-baseline` asks Codex to explore the repository and emit ranked regions directly. `codex-agent-contracts` first builds `contract-ranked` pre-context, includes the candidate files/line windows in the prompt, then asks Codex to emit final ranked regions. `codex-beat-sota1` gives Codex compact, scored `beat-sota1` candidate regions and asks it to rerank, drop, or replace regions only when repository evidence supports the change. `codex-beat-sota2` keeps the deterministic scorer but filters noisy precontext, labels evidence strength, withholds low-signal snippets, and tells Codex to form independent hypotheses before comparing candidates. All conditions use the same JSONL output shape, so their results can be paired.
+`codex-baseline` asks Codex to explore the repository and emit ranked regions directly. `codex-agent-contracts` first builds `contract-ranked` pre-context, includes the candidate files/line windows in the prompt, then asks Codex to emit final ranked regions. `codex-context-localized` gives Codex the v2 localized, gate-aware precontext and records the gate, selected bytes, selected regions, and noisy-path counts. `codex-beat-sota1` gives Codex compact, scored `beat-sota1` candidate regions and asks it to rerank, drop, or replace regions only when repository evidence supports the change. `codex-beat-sota2` keeps the deterministic scorer but filters noisy precontext, labels evidence strength, withholds low-signal snippets, and tells Codex to form independent hypotheses before comparing candidates. All conditions use the same JSONL output shape, so their results can be paired. For `--strategy context-localized` or `codex-context-localized`, pass `--model-profile spark`, `mini`, `frontier`, or `unknown` to exercise the same Agent Contracts gate limits used by the CLI/MCP flow; the selected profile is included in each output row's metadata.
 
 On a fresh local paired 76-instance run, `codex-beat-sota1` improved F1 and recall over `codex-baseline` but regressed weighted core coverage, hit-file, hit-region, precision, and context efficiency. Treat this as a mixed research signal, not a SOTA result.
 
@@ -313,6 +325,90 @@ codex exec --sandbox read-only --output-last-message {response_file} -C {repo} -
 ```
 
 Override it with `--codex-command` when using a profile, local provider, or alternate Codex model. The template supports `{repo}`, `{response_file}`, and `{instance_id}` placeholders.
+
+#### Quick SWE/Spark Evaluation Runbook
+
+Use this before any full SWE or SWE-Explore run. It creates a tiny filtered bench under `benchmark-results/quick-swe-spark/`, includes `psf__requests-5414` when that instance exists in your local bench, and prints commands without launching Codex unless `--run` is passed.
+
+The dry-run JSON includes `instances` and `missing_requested_instances`. Check those before `--run`; pass `--fallback-limit 0` when you want the command to fail instead of filling from the first available bench row if a requested instance is missing.
+
+Dry-run the exact commands:
+
+```bash
+python3 scripts/quick_swe_spark_eval.py \
+  --bench /path/to/SWE-Explore-Bench/bench.jsonl \
+  --repos /path/to/SWE-Explore-Bench \
+  --issue-map /path/to/SWE-Explore-Bench/issue_map.json \
+  --output-dir benchmark-results/quick-swe-spark
+```
+
+Run the small paired evaluation after reviewing the printed commands:
+
+```bash
+python3 scripts/quick_swe_spark_eval.py \
+  --bench /path/to/SWE-Explore-Bench/bench.jsonl \
+  --repos /path/to/SWE-Explore-Bench \
+  --issue-map /path/to/SWE-Explore-Bench/issue_map.json \
+  --output-dir benchmark-results/quick-swe-spark \
+  --run
+```
+
+The default paired conditions are:
+
+- `spark_baseline`: `codex-baseline` with no Agent Contracts precontext.
+- `context_localized_preflight`: deterministic `context-localized --model-profile spark` for inspecting selected files, selected regions, selected bytes, gate decision, and noisy/vendored-path counts.
+- `spark_context_localized`: `codex-context-localized --model-profile spark`, using the same Codex command as baseline plus the localized Agent Contracts precontext.
+
+Add two to five targeted cases with repeated `--instance`, and add the previous Agent Contracts path with `--include-legacy`:
+
+```bash
+python3 scripts/quick_swe_spark_eval.py \
+  --bench /path/to/SWE-Explore-Bench/bench.jsonl \
+  --repos /path/to/SWE-Explore-Bench \
+  --issue-map /path/to/SWE-Explore-Bench/issue_map.json \
+  --instance psf__requests-5414 \
+  --instance another__instance-123 \
+  --include-legacy \
+  --run
+```
+
+If your local Spark runner needs a specific command, pass it through the shared template:
+
+```bash
+python3 scripts/quick_swe_spark_eval.py \
+  --bench /path/to/SWE-Explore-Bench/bench.jsonl \
+  --repos /path/to/SWE-Explore-Bench \
+  --issue-map /path/to/SWE-Explore-Bench/issue_map.json \
+  --spark-codex-command 'codex exec --sandbox read-only --output-last-message {response_file} -C {repo} -' \
+  --run
+```
+
+Inspect the diagnostic outputs before looking only at pass/fail:
+
+```bash
+jq -c '{instance_id, explorer, regions, selected_bytes: .metadata.selected_bytes, gate: .metadata.context_localized.gate, noisy_path_count: .metadata.context_localized.noisy_path_count, vendored_noisy_path_count: .metadata.context_localized.vendored_noisy_path_count}' benchmark-results/quick-swe-spark/context_localized_preflight/top5.jsonl
+
+jq -c '{instance_id, explorer, num_regions, codex_returncode: .metadata.codex_returncode, gate: .metadata.precontext.gate, selected_bytes: .metadata.precontext.selected_bytes, risk_counts: .metadata.precontext.risk_counts, regions}' benchmark-results/quick-swe-spark/spark_context_localized/top5.jsonl
+
+jq -c '{instance_id, explorer, num_regions, codex_returncode: .metadata.codex_returncode, runner_error: .metadata.runner_error, regions}' benchmark-results/quick-swe-spark/spark_baseline/top5.jsonl
+```
+
+If you run restricted repair after localization, inspect patch breadth and pass/fail together:
+
+```bash
+python3 scripts/swe_restricted_repair.py \
+  --bench benchmark-results/quick-swe-spark/bench.quick-spark.jsonl \
+  --repos /path/to/SWE-Explore-Bench \
+  --issue-map benchmark-results/quick-swe-spark/issue_map.quick-spark.json \
+  --predictions benchmark-results/quick-swe-spark/spark_context_localized/top5.jsonl \
+  --mode subprocess \
+  --repair-command 'your-spark-repair-command --repo {repo} --output {response_file}' \
+  --output benchmark-results/quick-swe-spark/spark_context_localized/restricted-repair.jsonl
+
+jq -c '{instance_id, resolved, files_edited_count, files_edited, patch_bytes, patch_lines, commands_run, failure_reason}' benchmark-results/quick-swe-spark/spark_context_localized/restricted-repair.jsonl
+```
+
+This quick run is intentionally not the full SWE bench. Keep benchmark JSONL, local repos, generated patches, context packs, and repair outputs under ignored paths such as `benchmark-results/`.
 
 To test whether better context improves patch-style behavior, run restricted-context repair over any prediction file. Mock mode checks harness plumbing; subprocess mode should point at a fixed repair scaffold.
 

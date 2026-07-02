@@ -73,6 +73,108 @@ def tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "context_intent",
+            "description": "Classify a task and recommend the next progressive context tools.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string"},
+                },
+                "required": ["task"],
+            },
+        },
+        {
+            "name": "context_localize",
+            "description": "Rank issue-specific modules, files, and bounded line regions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "default": "."},
+                    "task": {"type": "string"},
+                    "max_candidate_files": {"type": "integer", "minimum": 1, "default": 24},
+                    "max_regions": {"type": "integer", "minimum": 1, "default": 12},
+                    "line_window": {"type": "integer", "minimum": 1, "default": 80},
+                    "max_bytes": {"type": "integer", "minimum": 1, "default": DEFAULT_MAX_BYTES},
+                    "model_profile": {"type": "string", "enum": list(agent_contracts.MODEL_PROFILE_NAMES), "default": "unknown"},
+                },
+                "required": ["task"],
+            },
+        },
+        {
+            "name": "context_read_region",
+            "description": "Read a bounded repository file window by path and line range.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "default": "."},
+                    "path": {"type": "string"},
+                    "start": {"type": "integer", "minimum": 1},
+                    "end": {"type": "integer", "minimum": 1},
+                    "context_lines": {"type": "integer", "minimum": 0, "default": 0},
+                },
+                "required": ["path", "start", "end"],
+            },
+        },
+        {
+            "name": "context_expand",
+            "description": "Expand from a localized file or region to related tests, imports, and module neighbors.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "default": "."},
+                    "path": {"type": "string"},
+                    "start": {"type": "integer", "minimum": 1},
+                    "end": {"type": "integer", "minimum": 1},
+                    "reason": {"type": "string", "default": ""},
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "context_gate",
+            "description": "Explain whether localized context is safe to inject, advisory only, tool-only, or should abstain.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "default": "."},
+                    "task": {"type": "string"},
+                    "model_profile": {"type": "string", "enum": list(agent_contracts.MODEL_PROFILE_NAMES), "default": "unknown"},
+                    "max_bytes": {"type": "integer", "minimum": 1, "default": DEFAULT_MAX_BYTES},
+                },
+                "required": ["task"],
+            },
+        },
+        {
+            "name": "context_pack_v2",
+            "description": "Build an issue-localized, gate-aware schema v2 evidence pack.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "default": "."},
+                    "task": {"type": "string"},
+                    "model_profile": {"type": "string", "enum": list(agent_contracts.MODEL_PROFILE_NAMES), "default": "unknown"},
+                    "max_regions": {"type": "integer", "minimum": 1, "default": 8},
+                    "line_window": {"type": "integer", "minimum": 1, "default": 80},
+                    "max_bytes": {"type": "integer", "minimum": 1, "default": DEFAULT_MAX_BYTES},
+                    "output": {"type": "string"},
+                },
+                "required": ["task"],
+            },
+        },
+        {
+            "name": "context_explain",
+            "description": "Return the audit trail for included and omitted localized context evidence.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "default": "."},
+                    "task": {"type": "string"},
+                    "model_profile": {"type": "string", "enum": list(agent_contracts.MODEL_PROFILE_NAMES), "default": "unknown"},
+                },
+                "required": ["task"],
+            },
+        },
+        {
             "name": "context_verify",
             "description": "Run the deterministic context-selection verifier against a manifest.",
             "inputSchema": {
@@ -100,6 +202,13 @@ def optional_int(arguments: dict[str, Any], key: str, default: int) -> int:
     value = arguments.get(key, default)
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError(f"`{key}` must be a positive integer")
+    return value
+
+
+def optional_nonnegative_int(arguments: dict[str, Any], key: str, default: int) -> int:
+    value = arguments.get(key, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"`{key}` must be a non-negative integer")
     return value
 
 
@@ -166,6 +275,85 @@ def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, A
         max_files = optional_int(args, "max_files", DEFAULT_MAX_FILES)
         max_bytes = optional_int(args, "max_bytes", DEFAULT_MAX_BYTES)
         return context_pack_summary(repo, task, max_files, max_bytes)
+
+    if name == "context_intent":
+        task = require_string(args, "task")
+        return agent_contracts.context_intent_payload(task)
+
+    if name == "context_localize":
+        repo = repo_path(args)
+        task = require_string(args, "task")
+        return agent_contracts.localize_issue_context(
+            repo,
+            task,
+            max_candidate_files=optional_int(args, "max_candidate_files", 24),
+            max_regions=optional_int(args, "max_regions", 12),
+            line_window=optional_int(args, "line_window", 80),
+            max_bytes=optional_int(args, "max_bytes", DEFAULT_MAX_BYTES),
+            model_profile=agent_contracts.model_profile_payload(args.get("model_profile", "unknown")),
+        )
+
+    if name == "context_read_region":
+        repo = repo_path(args)
+        path = require_string(args, "path")
+        start = optional_int(args, "start", 1)
+        end = optional_int(args, "end", start)
+        if end < start:
+            raise ValueError("`end` must be greater than or equal to `start`")
+        context_lines = optional_nonnegative_int(args, "context_lines", 0)
+        return agent_contracts.read_region_payload(repo, path, start, end, context_lines=context_lines)
+
+    if name == "context_expand":
+        repo = repo_path(args)
+        path = require_string(args, "path")
+        raw_start = args.get("start")
+        raw_end = args.get("end")
+        start = optional_int(args, "start", 1) if raw_start is not None else None
+        end = optional_int(args, "end", start or 1) if raw_end is not None else None
+        if (start is None) != (end is None):
+            raise ValueError("`start` and `end` must be provided together")
+        if start is not None and end is not None and end < start:
+            raise ValueError("`end` must be greater than or equal to `start`")
+        reason = args.get("reason", "")
+        if not isinstance(reason, str):
+            raise ValueError("`reason` must be a string")
+        return agent_contracts.context_expand_payload(repo, path, start=start, end=end, reason=reason)
+
+    if name == "context_gate":
+        repo = repo_path(args)
+        task = require_string(args, "task")
+        return agent_contracts.context_gate_payload(
+            repo,
+            task,
+            model_profile=args.get("model_profile", "unknown"),
+            max_bytes=optional_int(args, "max_bytes", DEFAULT_MAX_BYTES),
+        )
+
+    if name == "context_pack_v2":
+        repo = repo_path(args)
+        task = require_string(args, "task")
+        output_value = args.get("output")
+        output = None
+        if output_value is not None:
+            if not isinstance(output_value, str) or not output_value.strip():
+                raise ValueError("`output` must be a non-empty string")
+            output = Path(output_value)
+            if not output.is_absolute():
+                output = repo / output
+        return agent_contracts.build_context_pack_v2(
+            repo,
+            task,
+            output.resolve() if output is not None else None,
+            max_regions=optional_int(args, "max_regions", 8),
+            max_bytes=optional_int(args, "max_bytes", DEFAULT_MAX_BYTES),
+            line_window=optional_int(args, "line_window", 80),
+            model_profile=args.get("model_profile", "unknown"),
+        )
+
+    if name == "context_explain":
+        repo = repo_path(args)
+        task = require_string(args, "task")
+        return agent_contracts.context_explain_payload(repo, task, model_profile=args.get("model_profile", "unknown"))
 
     if name == "context_verify":
         repo = repo_path(args)
